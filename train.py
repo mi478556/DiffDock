@@ -1,4 +1,5 @@
 import copy
+import functools
 import math
 import os
 import shutil
@@ -57,6 +58,14 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                                                                optimizer=optimizer)
 
         logs = {}
+        loss_fn = functools.partial(
+            loss_function,
+            rank_weight=args.rank_weight,
+            rank_k=args.rank_k,
+            rank_sigma=args.rank_sigma,
+            rank_alpha_tr=args.rank_alpha_tr,
+            rank_alpha_rot=args.rank_alpha_rot,
+        )
         train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights if epoch > freeze_params else None)
         print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],

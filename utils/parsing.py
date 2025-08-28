@@ -136,6 +136,13 @@ def parse_train_args():
     parser.add_argument('--sidechain_loss_weight', type=float, default=0, help='')
     parser.add_argument('--backbone_loss_weight', type=float, default=0, help='')
 
+    #low rank
+    parser.add_argument("--rank_weight", type=float, default=0.0)
+    parser.add_argument("--rank_k", type=int, default=8)
+    parser.add_argument("--rank_sigma", type=float, default=2.0)
+    parser.add_argument("--rank_alpha_tr", type=float, default=0.25)
+    parser.add_argument("--rank_alpha_rot", type=float, default=0.25)
+
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')
     parser.add_argument('--pdbsidechain_esm_embeddings_path', type=str, default=None, help='')

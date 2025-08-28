@@ -11,6 +11,7 @@ from utils.torsion import modify_conformer_torsion_angles
 from scipy.spatial.transform import Rotation as R
 from utils.utils import crop_beyond
 from utils.logging_utils import get_logger
+from utils.rank_regularizer import low_rank_guidance_step_inplace
 
 
 def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, pocket_knowledge=False, pocket_cutoff=7,
@@ -69,7 +70,14 @@ def is_iterable(arr):
 def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_schedule, device, t_to_sigma, model_args,
              no_random=False, ode=False, visualization_list=None, confidence_model=None, confidence_data_list=None, confidence_model_args=None,
              t_schedule=None, batch_size=32, no_final_step_noise=False, pivot=None, return_full_trajectory=False,
-             temp_sampling=1.0, temp_psi=0.0, temp_sigma_data=0.5, return_features=False):
+             temp_sampling=1.0, temp_psi=0.0, temp_sigma_data=0.5, return_features=False,  rank_guidance=False,
+            rank_guidance_step=0.05,
+            rank_guidance_k=8,
+            rank_guidance_sigma=2.0,
+            rank_guidance_use_atoms=False,
+            rank_guidance_every=1,
+            rank_guidance_trust=0.5,
+            rank_guidance_heavy_only=False):
     N = len(data_list)
     trajectory = []
     logger = get_logger()
@@ -157,6 +165,16 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 else:
                     tor_perturb = None
 
+                if rank_guidance and (t_idx % max(1, int(rank_guidance_every)) == 0):
+                    low_rank_guidance_step_inplace(
+                        data_list,
+                        step_size=float(rank_guidance_step),
+                        rank_k=int(rank_guidance_k),
+                        gaussian_sigma=float(rank_guidance_sigma),
+                        use_receptor_atoms=bool(rank_guidance_use_atoms),
+                        mask_heavy_only=bool(rank_guidance_heavy_only),
+                        trust_radius=float(rank_guidance_trust),
+                    )
                 if not is_iterable(temp_sampling):
                     temp_sampling = [temp_sampling] * 3
                 if not is_iterable(temp_psi):

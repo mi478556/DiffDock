@@ -12,116 +12,89 @@ from utils.sampling import randomize_position, sampling
 from utils.diffusion_utils import get_t_schedule
 
 
-def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device, tr_weight=1, rot_weight=1,
-                  tor_weight=1, backbone_weight=0, sidechain_weight=0, apply_mean=True, no_torsion=False):
+# utils/training.py  — replace only loss_function with this version
+import numpy as np
+import torch
+from utils import so3, torus
+from utils.rank_regularizer import low_rank_contact_loss
+
+def loss_function(
+    tr_pred, rot_pred, tor_pred, data, t_to_sigma, device,
+    tr_weight: float = 1.0, rot_weight: float = 1.0, tor_weight: float = 1.0,
+    apply_mean: bool = True, no_torsion: bool = False,
+    # new knobs for the low-rank regularizer:
+    rank_weight: float = 0.0,        # set >0 to turn it on
+    rank_k: int = 8,
+    rank_sigma: float = 2.0,
+    rank_alpha_tr: float = 0.25,
+    rank_alpha_rot: float = 0.25,
+):
+    # get current sigmas for the batch, exactly as DiffDock does
     tr_sigma, rot_sigma, tor_sigma = t_to_sigma(
         *[torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' else data.complex_t[noise_type]
-          for noise_type in ['tr', 'rot', 'tor']])
+          for noise_type in ['tr', 'rot', 'tor']]
+    )
+
     mean_dims = (0, 1) if apply_mean else 1
 
-    # translation component
+    # translation
     tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
-    tr_sigma = tr_sigma.unsqueeze(-1)
-    tr_loss = ((tr_pred.cpu() - tr_score.cpu()) ** 2 * tr_sigma.cpu() ** 2).mean(dim=mean_dims)
-    tr_base_loss = (tr_score ** 2 * tr_sigma ** 2).mean(dim=mean_dims).detach()
+    tr_sigma_vec = tr_sigma.unsqueeze(-1)
+    tr_loss = ((tr_pred.cpu() - tr_score) ** 2 * tr_sigma_vec ** 2).mean(dim=mean_dims)
+    tr_base_loss = (tr_score ** 2 * tr_sigma_vec ** 2).mean(dim=mean_dims).detach()
 
-    # rotation component
+    # rotation
     rot_score = torch.cat([d.rot_score for d in data], dim=0) if device.type == 'cuda' else data.rot_score
     rot_score_norm = so3.score_norm(rot_sigma.cpu()).unsqueeze(-1)
-    rot_loss = (((rot_pred.cpu() - rot_score.cpu()) / rot_score_norm) ** 2).mean(dim=mean_dims)
-    rot_base_loss = ((rot_score.cpu() / rot_score_norm) ** 2).mean(dim=mean_dims).detach()
+    rot_loss = (((rot_pred.cpu() - rot_score) / rot_score_norm) ** 2).mean(dim=mean_dims)
+    rot_base_loss = ((rot_score / rot_score_norm) ** 2).mean(dim=mean_dims).detach()
 
-    # torsion component
+    # torsion
     if not no_torsion:
         edge_tor_sigma = torch.from_numpy(
-            np.concatenate([d.tor_sigma_edge for d in data] if device.type == 'cuda' else data.tor_sigma_edge))
+            np.concatenate([d.tor_sigma_edge for d in data] if device.type == 'cuda' else data.tor_sigma_edge)
+        )
         tor_score = torch.cat([d.tor_score for d in data], dim=0) if device.type == 'cuda' else data.tor_score
         tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float()
-        tor_loss = ((tor_pred.cpu() - tor_score.cpu()) ** 2 / tor_score_norm2)
-        tor_base_loss = ((tor_score.cpu() ** 2 / tor_score_norm2)).detach()
+        tor_loss = ((tor_pred.cpu() - tor_score) ** 2 / tor_score_norm2)
+        tor_base_loss = ((tor_score ** 2 / tor_score_norm2)).detach()
         if apply_mean:
-            tor_loss, tor_base_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float), tor_base_loss.mean() * torch.ones(1, dtype=torch.float)
+            tor_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float)
+            tor_base_loss = tor_base_loss.mean() * torch.ones(1, dtype=torch.float)
         else:
-            index = torch.cat([torch.ones(d['ligand'].edge_mask.sum()) * i for i, d in
-                               enumerate(data)]).long() if device.type == 'cuda' else data['ligand'].batch[
-                data['ligand', 'ligand'].edge_index[0][data['ligand'].edge_mask]]
+            index = torch.cat([torch.ones(d['ligand'].edge_mask.sum()) * i for i, d in enumerate(data)]).long() \
+                if device.type == 'cuda' else data['ligand'].batch[data['ligand', 'ligand'].edge_index[0][data['ligand'].edge_mask]]
             num_graphs = len(data) if device.type == 'cuda' else data.num_graphs
             t_l, t_b_l, c = torch.zeros(num_graphs), torch.zeros(num_graphs), torch.zeros(num_graphs)
             c.index_add_(0, index, torch.ones(tor_loss.shape))
-            c = c + 0.0001
+            c = c + 1e-4
             t_l.index_add_(0, index, tor_loss)
             t_b_l.index_add_(0, index, tor_base_loss)
             tor_loss, tor_base_loss = t_l / c, t_b_l / c
     else:
-        if apply_mean:
-            tor_loss, tor_base_loss = torch.zeros(1, dtype=torch.float), torch.zeros(1, dtype=torch.float)
-        else:
-            tor_loss, tor_base_loss = torch.zeros(len(rot_loss), dtype=torch.float), torch.zeros(len(rot_loss), dtype=torch.float)
+        tor_loss = torch.zeros(1, dtype=torch.float)
+        tor_base_loss = torch.zeros(1, dtype=torch.float) if apply_mean \
+            else torch.zeros(len(rot_loss), dtype=torch.float)
 
-    if backbone_weight > 0:
-        backbone_vecs = torch.cat([d['receptor'].side_chain_vecs.cpu() for d in data], dim=0) if device.type == 'cuda' else data['receptor'].side_chain_vecs
-        backbone_vecs = backbone_vecs[:, 4:]
-        backbone_pred = sidechain_pred[:, 4:]
+    # stock DiffDock weighted loss
+    loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
 
-        backbone_base_loss = (backbone_vecs ** 2).detach().mean(dim=1) + 0.0001
-        backbone_loss = ((backbone_pred.cpu() - backbone_vecs) ** 2).mean(dim=1) / backbone_base_loss.mean()
-        backbone_base_loss = backbone_base_loss / backbone_base_loss.mean()
-        if apply_mean:
-            backbone_loss, backbone_base_loss = backbone_loss.mean() * torch.ones(1, dtype=torch.float), backbone_base_loss.mean() * torch.ones(1, dtype=torch.float)
-        else:
-            index = torch.cat([torch.ones((d['receptor'].pos.shape[0])) * i for i, d in enumerate(data)], dim=0).long() if device.type == 'cuda' else data['receptor'].batch
-            num_graphs = len(data) if device.type == 'cuda' else data.num_graphs
-            s_l, s_b_l, c = torch.zeros(num_graphs), torch.zeros(num_graphs), torch.zeros(num_graphs)
-            c.index_add_(0, index, torch.ones(backbone_loss.shape[0]))
-            c = c + 0.0001
-            s_l.index_add_(0, index, backbone_loss)
-            s_b_l.index_add_(0, index, backbone_base_loss)
-            backbone_loss, backbone_base_loss = s_l / c, s_b_l / c
-    else:
-        if apply_mean:
-            backbone_loss, backbone_base_loss = torch.zeros(1, dtype=torch.float), torch.zeros(1, dtype=torch.float)
-        else:
-            backbone_loss, backbone_base_loss = torch.zeros(len(rot_loss), dtype=torch.float), torch.zeros(len(rot_loss), dtype=torch.float)
+    # add our low-rank contact loss, computed from a one-step denoised pose
+    if rank_weight > 0.0:
+        # pass the model outputs and tr_sigma so the step size can adapt to noise level
+        lr_loss = low_rank_contact_loss(
+            data=data,
+            tr_pred=tr_pred.to(device), rot_pred=rot_pred.to(device),
+            tr_sigma=tr_sigma.to(device) if isinstance(tr_sigma, torch.Tensor) else None,
+            rank_k=int(rank_k),
+            gaussian_sigma=float(rank_sigma),
+            alpha_tr=float(rank_alpha_tr),
+            alpha_rot=float(rank_alpha_rot),
+            use_receptor_atoms=True
+        )
+        loss = loss + rank_weight * lr_loss
 
-    if sidechain_weight > 0:
-        sidechain_vecs = torch.cat([d['receptor'].side_chain_vecs.cpu() for d in data],
-                                  dim=0) if device.type == 'cuda' else data['receptor'].side_chain_vecs
-        chi_angles = sidechain_vecs[:, :4].to(device)
-        chi_pred = sidechain_pred[:, :4].to(device)
-
-        chi_pred = torch.where(torch.isnan(chi_angles), torch.zeros_like(chi_angles, device=device), chi_pred)
-        chi_angles = torch.where(torch.isnan(chi_angles), torch.zeros_like(chi_angles, device=device), chi_angles)
-
-        difference = torch.abs(chi_pred - chi_angles)
-        difference = torch.min(difference, 1 - difference) # angles are circular and 360 degrees = 1
-
-        sidechain_base_loss = (chi_angles ** 2).detach().mean(dim=1) + 0.0001
-        sidechain_loss = (difference ** 2).mean(dim=1) / sidechain_base_loss.mean()
-        sidechain_base_loss = sidechain_base_loss / sidechain_base_loss.mean()
-        if apply_mean:
-            sidechain_loss, sidechain_base_loss = \
-                sidechain_loss.mean().cpu() * torch.ones(1, dtype=torch.float), \
-                sidechain_base_loss.mean().cpu() * torch.ones(1, dtype=torch.float)
-        else:
-            index = torch.cat([torch.ones((d['receptor'].pos.shape[0])) * i for i, d in enumerate(data)],
-                              dim=0).long() if device.type == 'cuda' else data['receptor'].batch
-            num_graphs = len(data) if device.type == 'cuda' else data.num_graphs
-            s_l, s_b_l, c = torch.zeros(num_graphs), torch.zeros(num_graphs), torch.zeros(num_graphs)
-            c.index_add_(0, index, torch.ones(sidechain_loss.shape[0]))
-            c = c + 0.0001
-            s_l.index_add_(0, index, sidechain_loss.cpu())
-            s_b_l.index_add_(0, index, sidechain_base_loss.cpu())
-            sidechain_loss, sidechain_base_loss = s_l / c, s_b_l / c
-    else:
-        if apply_mean:
-            sidechain_loss, sidechain_base_loss = torch.zeros(1, dtype=torch.float), torch.zeros(1, dtype=torch.float)
-        else:
-            sidechain_loss, sidechain_base_loss = torch.zeros(len(rot_loss), dtype=torch.float), torch.zeros(
-                len(rot_loss), dtype=torch.float)
-
-    loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight + sidechain_loss * sidechain_weight + backbone_loss * backbone_weight
-    return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), backbone_loss.detach(), sidechain_loss.detach(), \
-           tr_base_loss, rot_base_loss, tor_base_loss, backbone_base_loss, sidechain_base_loss
+    return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
 
 
 class AverageMeter():

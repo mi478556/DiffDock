@@ -10,6 +10,7 @@ import warnings
 from typing import Mapping, Optional
 
 import yaml
+from utils.rank_regularizer import low_rank_guidance_step_inplace
 
 # Ignore pandas deprecation warning around pyarrow
 warnings.filterwarnings("ignore", category=DeprecationWarning,
@@ -101,6 +102,16 @@ def get_parser():
     parser.add_argument('--gnina_full_dock', action='store_true', default=False, help='')
     parser.add_argument('--gnina_autobox_add', type=float, default=4.0)
     parser.add_argument('--gnina_poses_to_optimize', type=int, default=1)
+
+    parser.add_argument("--rank_guidance", action="store_true", help="enable low rank contact guidance at sampling")
+    parser.add_argument("--rank_guidance_step", type=float, default=0.05)
+    parser.add_argument("--rank_guidance_k", type=int, default=8)
+    parser.add_argument("--rank_guidance_sigma", type=float, default=2.0)
+    parser.add_argument("--rank_guidance_use_atoms", action="store_true", help="use receptor atoms, default uses residues")
+    parser.add_argument("--rank_guidance_every", type=int, default=1, help="apply every n denoise steps")
+    parser.add_argument("--rank_guidance_trust", type=float, default=0.5, help="max move per step in angstrom")
+    parser.add_argument("--rank_guidance_heavy_only", action="store_true", help="apply only on heavy atoms")
+
 
     return parser
 
@@ -268,7 +279,15 @@ def main(args):
                                                             args.temp_sampling_tor],
                                              temp_psi=[args.temp_psi_tr, args.temp_psi_rot, args.temp_psi_tor],
                                              temp_sigma_data=[args.temp_sigma_data_tr, args.temp_sigma_data_rot,
-                                                              args.temp_sigma_data_tor])
+                                                              args.temp_sigma_data_tor],
+                                                               rank_guidance=args.rank_guidance,
+                                             rank_guidance_step=args.rank_guidance_step,
+                                             rank_guidance_k=args.rank_guidance_k,
+                                             rank_guidance_sigma=args.rank_guidance_sigma,
+                                             rank_guidance_use_atoms=args.rank_guidance_use_atoms,
+                                             rank_guidance_every=args.rank_guidance_every,
+                                             rank_guidance_trust=args.rank_guidance_trust,
+                                             rank_guidance_heavy_only=args.rank_guidance_heavy_only)
 
             ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in data_list])
 
