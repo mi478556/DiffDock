@@ -52,6 +52,7 @@ def parse_train_args():
     parser.add_argument('--num_workers', type=int, default=1, help='Number of workers for preprocessing')
     parser.add_argument('--use_ema', action='store_true', default=False, help='Whether or not to use ema for the model weights')
     parser.add_argument('--ema_rate', type=float, default=0.999, help='decay rate for the exponential moving average model parameters ')
+    parser.add_argument('--enable_logging', action='store_true', default=False, help='Enable per-epoch CSV and TensorBoard logging into the run_dir')
 
     # Dataset
     parser.add_argument('--limit_complexes', type=int, default=5, help='If positive, the number of training and validation complexes is capped') # TODO change

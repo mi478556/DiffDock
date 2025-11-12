@@ -14,6 +14,7 @@ rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (64000, rlimit[1]))
 
 import yaml
+import time
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, t_to_sigma_individual
 from datasets.loader import construct_loader
 from utils.parsing import parse_train_args
@@ -38,6 +39,36 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     if args.scheduler == 'layer_linear_warmup':
         freeze_params = args.warmup_dur * (args.num_conv_layers + 2) - 1
         print("Freezing some parameters until epoch {}".format(freeze_params))
+
+    # ensure run_dir exists (run_dir comes from main_function and points to args.log_dir/args.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Optional per-epoch logging (CSV + TensorBoard). Enabled via --enable_logging to avoid
+    # injecting IO for users who don't want it. When enabled we append a CSV row each epoch
+    # and write scalars to TensorBoard under run_dir/tensorboard.
+    csv_writer = None
+    csv_file = None
+    tb_writer = None
+    if hasattr(args, 'enable_logging') and args.enable_logging:
+        try:
+            import csv as _csv
+            from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+            csv_path = os.path.join(run_dir, 'training_log.csv')
+            csv_header = ['epoch', 'train_loss', 'tr_loss', 'rot_loss', 'tor_loss',
+                          'val_loss', 'val_tr', 'val_rot', 'val_tor',
+                          'valinf_min_rmsds_lt2', 'valinf_min_rmsds_lt5', 'lr', 'timestamp']
+            csv_exists = os.path.exists(csv_path)
+            csv_file = open(csv_path, 'a', newline='')
+            csv_writer = _csv.writer(csv_file)
+            if not csv_exists:
+                csv_writer.writerow(csv_header)
+                csv_file.flush()
+            try:
+                tb_writer = _SummaryWriter(log_dir=os.path.join(run_dir, 'tensorboard'))
+            except Exception:
+                tb_writer = None
+        except Exception as e:
+            print('Warning: failed to initialize logging:', e)
 
     print("Starting training...")
     for epoch in range(args.n_epochs):
@@ -102,7 +133,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
         if epoch > freeze_params:
             if not args.use_ema: ema_weights.copy_to(model.parameters())
-            ema_state_dict = copy.deepcopy(model.module.state_dict() if device.type == 'cuda' else model.state_dict())
+            # model may be wrapped in a DataParallel-like module (model.module) or not; be robust to either
+            ema_state_dict = copy.deepcopy(getattr(model, 'module', model).state_dict())
             ema_weights.restore(model.parameters())
 
         if args.wandb:
@@ -111,7 +143,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             logs['current_lr'] = optimizer.param_groups[0]['lr']
             wandb.log(logs, step=epoch + 1)
 
-        state_dict = model.module.state_dict() if device.type == 'cuda' else model.state_dict()
+        # Be robust whether the model is wrapped (has attribute 'module') or not.
+        state_dict = getattr(model, 'module', model).state_dict()
         if args.inference_earlystop_metric in logs.keys() and \
                 (args.inference_earlystop_goal == 'min' and logs[args.inference_earlystop_metric] <= best_val_inference_value or
                  args.inference_earlystop_goal == 'max' and logs[args.inference_earlystop_metric] >= best_val_inference_value):
@@ -153,6 +186,47 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             'optimizer': optimizer.state_dict(),
             'ema_weights': ema_weights.state_dict(),
         }, os.path.join(run_dir, 'last_model.pt'))
+
+        # Optional per-epoch logging: write CSV row and TensorBoard scalars when enabled
+        if csv_writer is not None:
+            try:
+                current_lr = optimizer.param_groups[0]['lr'] if optimizer is not None else None
+                valinf_min_rmsds_lt2 = logs.get('valinf_min_rmsds_lt2', None)
+                valinf_min_rmsds_lt5 = logs.get('valinf_min_rmsds_lt5', None)
+
+                csv_writer.writerow([
+                    epoch,
+                    train_losses.get('loss') if isinstance(train_losses, dict) else None,
+                    train_losses.get('tr_loss') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rot_loss') if isinstance(train_losses, dict) else None,
+                    train_losses.get('tor_loss') if isinstance(train_losses, dict) else None,
+                    val_losses.get('loss') if isinstance(val_losses, dict) else None,
+                    val_losses.get('tr_loss') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rot_loss') if isinstance(val_losses, dict) else None,
+                    val_losses.get('tor_loss') if isinstance(val_losses, dict) else None,
+                    valinf_min_rmsds_lt2,
+                    valinf_min_rmsds_lt5,
+                    current_lr,
+                    time.time()
+                ])
+                csv_file.flush()
+
+                if tb_writer is not None:
+                    if isinstance(train_losses, dict) and train_losses.get('loss') is not None:
+                        tb_writer.add_scalar('train/loss', train_losses.get('loss'), epoch)
+                    if isinstance(val_losses, dict) and val_losses.get('loss') is not None:
+                        tb_writer.add_scalar('val/loss', val_losses.get('loss'), epoch)
+                    if valinf_min_rmsds_lt2 is not None:
+                        tb_writer.add_scalar('val/inference_min_rmsds_lt2', valinf_min_rmsds_lt2, epoch)
+                    if current_lr is not None:
+                        tb_writer.add_scalar('train/lr', current_lr, epoch)
+                    if isinstance(train_losses, dict):
+                        for k in ['tr_loss', 'rot_loss', 'tor_loss']:
+                            if train_losses.get(k) is not None:
+                                tb_writer.add_scalar(f'train/{k}', train_losses.get(k), epoch)
+                    tb_writer.flush()
+            except Exception as e:
+                print('Warning: failed to write epoch logs', e)
 
     print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
     print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
@@ -198,18 +272,18 @@ def main_function():
             dict = torch.load(f'{args.restart_dir}/{args.restart_ckpt}.pt', map_location=torch.device('cpu'))
             if args.restart_lr is not None: dict['optimizer']['param_groups'][0]['lr'] = args.restart_lr
             optimizer.load_state_dict(dict['optimizer'])
-            model.module.load_state_dict(dict['model'], strict=True)
+            getattr(model, 'module', model).load_state_dict(dict['model'], strict=True)
             if hasattr(args, 'ema_rate'):
                 ema_weights.load_state_dict(dict['ema_weights'], device=device)
             print("Restarting from epoch", dict['epoch'])
         except Exception as e:
             print("Exception", e)
             dict = torch.load(f'{args.restart_dir}/best_model.pt', map_location=torch.device('cpu'))
-            model.module.load_state_dict(dict, strict=True)
+            getattr(model, 'module', model).load_state_dict(dict, strict=True)
             print("Due to exception had to take the best epoch and no optimiser")
     elif args.pretrain_dir:
         dict = torch.load(f'{args.pretrain_dir}/{args.pretrain_ckpt}.pt', map_location=torch.device('cpu'))
-        model.module.load_state_dict(dict, strict=True)
+        getattr(model, 'module', model).load_state_dict(dict, strict=True)
         print("Using pretrained model", f'{args.pretrain_dir}/{args.pretrain_ckpt}.pt')
 
     numel = sum([p.numel() for p in model.parameters()])

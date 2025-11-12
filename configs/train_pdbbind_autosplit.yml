@@ -1,0 +1,28 @@
+# Training config for PDBBind using auto-generated splits
+# updated for long training using the grid-selected params
+log_dir: workdir/pdbbind_autosplit
+run_name: ema_best_lr1e-3_w20-40-40_no_rank
+dataset: pdbbind
+pdbbind_dir: data/PDBBind_processed/
+split_train: data/PDBBind_processed/splits/timesplit_no_lig_overlap_train
+split_val: data/PDBBind_processed/splits/timesplit_no_lig_overlap_val
+split_test: data/PDBBind_processed/splits/timesplit_test
+batch_size: 16
+n_epochs: 850
+limit_complexes: 0
+use_ema: true
+wandb: false
+# low-rank contact regularizer disabled for full run
+rank_weight: 0.0
+# keep defaults for rank_k and rank_sigma unless you want to change them
+# turn on the optional per-epoch logging (train.py respects --enable_logging or this key)
+enable_logging: true
+# recommended hyperparameters from the 20-epoch grid
+lr: 0.001
+tr_weight: 0.20
+rot_weight: 0.40
+tor_weight: 0.40
+# scheduler omitted (nosched). If you prefer plateau, set:
+# scheduler: plateau
+# scheduler_patience: 30
+# model / diffusion defaults are left as repo defaults; adjust as needed

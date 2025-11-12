@@ -37,9 +37,9 @@ def _stack_graph_field(data, key0: str, key1: str) -> Tensor:
     Works for CUDA DataParallel lists and for single PyG Batch.
     """
     if isinstance(data, (list, tuple)):  # DataParallel data_list
-        return torch.cat([d[key0].__dict__[key1] for d in data], dim=0)
+        return torch.cat([getattr(d[key0], key1) for d in data], dim=0)
     else:
-        return data[key0].__dict__[key1]
+        return getattr(data[key0], key1)
 
 def _make_batch_index(data, key0: str, n_graphs: Optional[int] = None) -> Tensor:
     """
@@ -136,18 +136,19 @@ def low_rank_contact_loss(
     device = tr_pred.device
     B = _num_graphs(data)
 
-    lig_pos_t = _stack_graph_field(data, 'ligand', 'pos')           # [NL,3]
-    lig_batch = _make_batch_index(data, 'ligand')                   # [NL]
-    lig_x = _stack_graph_field(data, 'ligand', 'x')                 # categorical features
+    # ensure graph tensors live on the same device as model predictions
+    lig_pos_t = _stack_graph_field(data, 'ligand', 'pos').to(device)           # [NL,3]
+    lig_batch = _make_batch_index(data, 'ligand').to(device)                   # [NL]
+    lig_x = _stack_graph_field(data, 'ligand', 'x').to(device)                 # categorical features
     lig_mask_heavy = _heavy_atom_mask(lig_x)
 
     # receptor positions: prefer atom graph if present
     try:
-        rec_pos = _stack_graph_field(data, 'atom' if use_receptor_atoms else 'receptor', 'pos')
-        rec_batch = _make_batch_index(data, 'atom' if use_receptor_atoms else 'receptor')
+        rec_pos = _stack_graph_field(data, 'atom' if use_receptor_atoms else 'receptor', 'pos').to(device)
+        rec_batch = _make_batch_index(data, 'atom' if use_receptor_atoms else 'receptor').to(device)
     except Exception:
-        rec_pos = _stack_graph_field(data, 'receptor', 'pos')
-        rec_batch = _make_batch_index(data, 'receptor')
+        rec_pos = _stack_graph_field(data, 'receptor', 'pos').to(device)
+        rec_batch = _make_batch_index(data, 'receptor').to(device)
 
     # step sizes, make them gentle and scale by current σ_tr if provided
     if tr_sigma is not None:
@@ -196,8 +197,8 @@ def low_rank_contact_loss(
 
 def _stack(data, key0: str, key1: str) -> Tensor:
     if isinstance(data, (list, tuple)):
-        return torch.cat([d[key0].__dict__[key1] for d in data], dim=0)
-    return data[key0].__dict__[key1]
+        return torch.cat([getattr(d[key0], key1) for d in data], dim=0)
+    return getattr(data[key0], key1)
 
 def _batch_index(data, key0: str) -> Tensor:
     if isinstance(data, (list, tuple)):

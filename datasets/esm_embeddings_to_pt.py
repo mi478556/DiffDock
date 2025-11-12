@@ -11,6 +11,15 @@ parser.add_argument('--output_path', type=str, default='data/BindingMOAD_2020_ab
 args = parser.parse_args()
 
 dict = {}
-for filename in tqdm(os.listdir(args.esm_embeddings_path)):
-    dict[filename.split('.')[0]] = torch.load(os.path.join(args.esm_embeddings_path,filename))['representations'][33]
-torch.save(dict,args.output_path)
+# Prefer a deterministic order and show a tqdm progress bar with a description
+files = sorted([f for f in os.listdir(args.esm_embeddings_path) if os.path.isfile(os.path.join(args.esm_embeddings_path, f))])
+for filename in tqdm(files, desc='Converting embeddings', total=len(files)):
+    try:
+        key = os.path.splitext(filename)[0]
+        data = torch.load(os.path.join(args.esm_embeddings_path, filename))
+        # keep only the desired layer representation
+        dict[key] = data['representations'][33]
+    except Exception as e:
+        # skip problematic files but show a short message on error
+        tqdm.write(f"Skipping {filename}: {e}")
+torch.save(dict, args.output_path)

@@ -19,6 +19,7 @@ import numpy as np
 import wandb
 from rdkit import RDLogger
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch
 from rdkit.Chem import RemoveAllHs
 
 from datasets.pdbbind import PDBBind
@@ -345,6 +346,11 @@ if __name__ == '__main__':
         gnina_metrics = {}
 
     for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
+        # DataListLoader on GPU/other codepaths may yield lists of Data objects.
+        # Normalize to a single Batch for downstream code that expects batched attributes
+        # like ['ligand'].complex_t etc.
+        if isinstance(orig_complex_graph, list):
+            orig_complex_graph = Batch.from_data_list(orig_complex_graph)
         torch.cuda.empty_cache()
 
         if confidence_model is not None and not (confidence_args.use_original_model_cache or confidence_args.transfer_weights) \

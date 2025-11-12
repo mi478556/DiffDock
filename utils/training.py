@@ -19,7 +19,7 @@ from utils import so3, torus
 from utils.rank_regularizer import low_rank_contact_loss
 
 def loss_function(
-    tr_pred, rot_pred, tor_pred, data, t_to_sigma, device,
+    tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device,
     tr_weight: float = 1.0, rot_weight: float = 1.0, tor_weight: float = 1.0,
     apply_mean: bool = True, no_torsion: bool = False,
     # new knobs for the low-rank regularizer:
@@ -29,63 +29,91 @@ def loss_function(
     rank_alpha_tr: float = 0.25,
     rank_alpha_rot: float = 0.25,
 ):
-    # get current sigmas for the batch, exactly as DiffDock does
-    tr_sigma, rot_sigma, tor_sigma = t_to_sigma(
-        *[torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' else data.complex_t[noise_type]
-          for noise_type in ['tr', 'rot', 'tor']]
-    )
+    # Gather complex times for the batch (support both list and Batched inputs)
+    if isinstance(data, list):
+        complex_t_tr = torch.cat([d.complex_t['tr'] for d in data])
+        complex_t_rot = torch.cat([d.complex_t['rot'] for d in data])
+        complex_t_tor = torch.cat([d.complex_t['tor'] for d in data])
+    else:
+        complex_t_tr = data.complex_t['tr']
+        complex_t_rot = data.complex_t['rot']
+        complex_t_tor = data.complex_t['tor']
+
+    tr_sigma, rot_sigma, tor_sigma = t_to_sigma(complex_t_tr, complex_t_rot, complex_t_tor)
+
+    # Ensure sigmas/live tensors live on the same device as model outputs
+    pred_device = tr_pred.device if isinstance(tr_pred, torch.Tensor) else device
+    if isinstance(tr_sigma, torch.Tensor):
+        tr_sigma = tr_sigma.to(pred_device)
+    if isinstance(rot_sigma, torch.Tensor):
+        rot_sigma = rot_sigma.to(pred_device)
+    if isinstance(tor_sigma, torch.Tensor):
+        tor_sigma = tor_sigma.to(pred_device)
 
     mean_dims = (0, 1) if apply_mean else 1
 
     # translation
-    tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
+    if isinstance(data, list):
+        tr_score = torch.cat([d.tr_score for d in data], dim=0).to(pred_device)
+    else:
+        tr_score = data.tr_score.to(pred_device)
     tr_sigma_vec = tr_sigma.unsqueeze(-1)
-    tr_loss = ((tr_pred.cpu() - tr_score) ** 2 * tr_sigma_vec ** 2).mean(dim=mean_dims)
+    tr_loss = ((tr_pred - tr_score) ** 2 * tr_sigma_vec ** 2).mean(dim=mean_dims)
     tr_base_loss = (tr_score ** 2 * tr_sigma_vec ** 2).mean(dim=mean_dims).detach()
 
     # rotation
-    rot_score = torch.cat([d.rot_score for d in data], dim=0) if device.type == 'cuda' else data.rot_score
-    rot_score_norm = so3.score_norm(rot_sigma.cpu()).unsqueeze(-1)
-    rot_loss = (((rot_pred.cpu() - rot_score) / rot_score_norm) ** 2).mean(dim=mean_dims)
+    if isinstance(data, list):
+        rot_score = torch.cat([d.rot_score for d in data], dim=0).to(pred_device)
+    else:
+        rot_score = data.rot_score.to(pred_device)
+    rot_score_norm = so3.score_norm(rot_sigma.cpu()).unsqueeze(-1).to(pred_device)
+    rot_loss = (((rot_pred - rot_score) / rot_score_norm) ** 2).mean(dim=mean_dims)
     rot_base_loss = ((rot_score / rot_score_norm) ** 2).mean(dim=mean_dims).detach()
 
     # torsion
     if not no_torsion:
-        edge_tor_sigma = torch.from_numpy(
-            np.concatenate([d.tor_sigma_edge for d in data] if device.type == 'cuda' else data.tor_sigma_edge)
-        )
-        tor_score = torch.cat([d.tor_score for d in data], dim=0) if device.type == 'cuda' else data.tor_score
-        tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float()
-        tor_loss = ((tor_pred.cpu() - tor_score) ** 2 / tor_score_norm2)
+        if isinstance(data, list):
+            edge_tor_arr = np.concatenate([d.tor_sigma_edge for d in data])
+            edge_tor_sigma = torch.from_numpy(edge_tor_arr)
+            tor_score = torch.cat([d.tor_score for d in data], dim=0).to(pred_device)
+        else:
+            edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge)
+            tor_score = data.tor_score.to(pred_device)
+
+        tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float().to(pred_device)
+        tor_loss = ((tor_pred - tor_score) ** 2 / tor_score_norm2)
         tor_base_loss = ((tor_score ** 2 / tor_score_norm2)).detach()
         if apply_mean:
-            tor_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float)
-            tor_base_loss = tor_base_loss.mean() * torch.ones(1, dtype=torch.float)
+            tor_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float, device=pred_device)
+            tor_base_loss = tor_base_loss.mean() * torch.ones(1, dtype=torch.float, device=pred_device)
         else:
-            index = torch.cat([torch.ones(d['ligand'].edge_mask.sum()) * i for i, d in enumerate(data)]).long() \
-                if device.type == 'cuda' else data['ligand'].batch[data['ligand', 'ligand'].edge_index[0][data['ligand'].edge_mask]]
-            num_graphs = len(data) if device.type == 'cuda' else data.num_graphs
-            t_l, t_b_l, c = torch.zeros(num_graphs), torch.zeros(num_graphs), torch.zeros(num_graphs)
-            c.index_add_(0, index, torch.ones(tor_loss.shape))
+            if isinstance(data, list):
+                index = torch.cat([torch.ones(int(d['ligand'].edge_mask.sum())) * i for i, d in enumerate(data)]).long().to(pred_device)
+                num_graphs = len(data)
+            else:
+                index = data['ligand'].batch[data['ligand', 'ligand'].edge_index[0][data['ligand'].edge_mask]]
+                num_graphs = data.num_graphs
+            t_l = torch.zeros(num_graphs, device=pred_device)
+            t_b_l = torch.zeros(num_graphs, device=pred_device)
+            c = torch.zeros(num_graphs, device=pred_device)
+            c.index_add_(0, index, torch.ones(tor_loss.shape, device=pred_device))
             c = c + 1e-4
-            t_l.index_add_(0, index, tor_loss)
-            t_b_l.index_add_(0, index, tor_base_loss)
+            t_l.index_add_(0, index, tor_loss.to(pred_device))
+            t_b_l.index_add_(0, index, tor_base_loss.to(pred_device))
             tor_loss, tor_base_loss = t_l / c, t_b_l / c
     else:
-        tor_loss = torch.zeros(1, dtype=torch.float)
-        tor_base_loss = torch.zeros(1, dtype=torch.float) if apply_mean \
-            else torch.zeros(len(rot_loss), dtype=torch.float)
+        tor_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+        tor_base_loss = torch.zeros(1, dtype=torch.float, device=pred_device) if apply_mean else torch.zeros(len(rot_loss), dtype=torch.float, device=pred_device)
 
     # stock DiffDock weighted loss
     loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
 
     # add our low-rank contact loss, computed from a one-step denoised pose
     if rank_weight > 0.0:
-        # pass the model outputs and tr_sigma so the step size can adapt to noise level
         lr_loss = low_rank_contact_loss(
             data=data,
-            tr_pred=tr_pred.to(device), rot_pred=rot_pred.to(device),
-            tr_sigma=tr_sigma.to(device) if isinstance(tr_sigma, torch.Tensor) else None,
+            tr_pred=tr_pred.to(pred_device), rot_pred=rot_pred.to(pred_device),
+            tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
             rank_k=int(rank_k),
             gaussian_sigma=float(rank_sigma),
             alpha_tr=float(rank_alpha_tr),
@@ -252,7 +280,8 @@ def inference_epoch_fix(model, complex_graphs, device, t_to_sigma, args):
         failed_convergence_counter = 0
         while predictions_list == None:
             try:
-                predictions_list, confidences = sampling(data_list=data_list, model=model.module if device.type == 'cuda' else model,
+                # pass the underlying model whether or not it's wrapped in DataParallel
+                predictions_list, confidences = sampling(data_list=data_list, model=getattr(model, 'module', model),
                                                          inference_steps=args.inference_steps,
                                                          tr_schedule=tr_schedule, rot_schedule=rot_schedule,
                                                          tor_schedule=tor_schedule,

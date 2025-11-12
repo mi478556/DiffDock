@@ -275,7 +275,15 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                                            (hasattr(args, 'backbone_loss_weight') and args.backbone_loss_weight > 0),
                             depthwise_convolution=args.depthwise_convolution if hasattr(args, 'depthwise_convolution') else False)
 
-    if device.type == 'cuda' and not no_parallel and ('dataset' not in args or not args.dataset == 'torsional'):
+    # Only enable DataParallel if the user explicitly requests parallel training
+    # via the `--parallel` argument (and requests more than 1 device). This
+    # prevents accidental multi-GPU wrapping when the user intends a single
+    # device run (e.g., `cuda:0`) and avoids implicit scattering bugs.
+    try:
+        parallel_flag = int(args.parallel) if hasattr(args, 'parallel') and args.parallel is not None else 1
+    except Exception:
+        parallel_flag = 1
+    if device.type == 'cuda' and parallel_flag > 1 and ('dataset' not in args or not args.dataset == 'torsional'):
         model = DataParallel(model)
     model.to(device)
     return model

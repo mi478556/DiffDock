@@ -218,7 +218,9 @@ class ConfidenceDataset(Dataset):
         model = model.to(self.device)
         model.eval()
 
-        tr_schedule = get_t_schedule(inference_steps=self.inference_steps)
+        # Use sigma_schedule from the original model args if present, otherwise fall back to 'expbeta'
+        sigma_schedule = getattr(self.original_model_args, 'sigma_schedule', 'expbeta')
+        tr_schedule = get_t_schedule(sigma_schedule, inference_steps=self.inference_steps)
         rot_schedule = tr_schedule
         tor_schedule = tr_schedule
         print('common t schedule', tr_schedule)

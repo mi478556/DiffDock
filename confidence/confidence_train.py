@@ -11,6 +11,7 @@ import wandb
 import torch
 from sklearn.metrics import roc_auc_score
 from torch_geometric.loader import DataListLoader, DataLoader
+from torch_geometric.data import Batch
 from tqdm import tqdm
 
 from confidence.dataset import ConfidenceDataset
@@ -113,11 +114,25 @@ def train_epoch(model, loader, optimizer, rmsd_prediction):
     meter = AverageMeter(['confidence_loss'])
 
     for data in tqdm(loader, total=len(loader)):
-        if device.type == 'cuda' and len(data) % torch.cuda.device_count() == 1 or device.type == 'cpu' and data.num_graphs == 1:
+        # normalize input: if DataListLoader returned a list, convert to a Batch
+        # and move tensors to device. This mirrors the diffusion training path
+        # where lists are converted to Batched tensors before calling the model.
+        if isinstance(data, list):
+            # move each entry to device then pack into a Batch for the model
+            data = Batch.from_data_list([d.to(device) for d in data])
+        else:
+            # single Batch object: move to device
+            if hasattr(data, 'to'):
+                data = data.to(device)
+
+        if device.type == 'cuda' and data.num_graphs == 1 or device.type == 'cpu' and data.num_graphs == 1:
             print("Skipping batch of size 1 since otherwise batchnorm would not work.")
         optimizer.zero_grad()
         try:
             pred = model(data)
+            # some model variants return (confidence, atom_confidence); accept that and use the first element
+            if isinstance(pred, tuple):
+                pred = pred[0]
             if rmsd_prediction:
                 labels = torch.cat([graph.rmsd for graph in data]).to(device) if isinstance(data, list) else data.rmsd
                 confidence_loss = F.mse_loss(pred, labels)
@@ -151,8 +166,18 @@ def test_epoch(model, loader, rmsd_prediction):
     all_labels = []
     for data in tqdm(loader, total=len(loader)):
         try:
+            # As in train_epoch, ensure we pass a Batched object to the model
+            if isinstance(data, list):
+                data = Batch.from_data_list([d.to(device) for d in data])
+            else:
+                if hasattr(data, 'to'):
+                    data = data.to(device)
+
             with torch.no_grad():
                 pred = model(data)
+                # some models return (confidence, atom_confidence) — use the main prediction
+                if isinstance(pred, tuple):
+                    pred = pred[0]
             affinity_loss = torch.tensor(0.0, dtype=torch.float, device=pred[0].device)
             accuracy = torch.tensor(0.0, dtype=torch.float, device=pred[0].device)
             if rmsd_prediction:
@@ -225,7 +250,8 @@ def train(args, model, optimizer, scheduler, train_loader, val_loader, run_dir):
         if scheduler:
             scheduler.step(val_metrics[args.main_metric])
 
-        state_dict = model.module.state_dict() if device.type == 'cuda' else model.state_dict()
+        # Be robust whether model is wrapped (has attribute 'module') or not
+        state_dict = getattr(model, 'module', model).state_dict()
 
         if args.main_metric_goal == 'min' and val_metrics[args.main_metric] < best_val_metric or \
                 args.main_metric_goal == 'max' and val_metrics[args.main_metric] > best_val_metric:
@@ -294,7 +320,7 @@ if __name__ == '__main__':
 
     elif args.restart_dir:
         dict = torch.load(f'{args.restart_dir}/last_model.pt', map_location=torch.device('cpu'))
-        model.module.load_state_dict(dict['model'], strict=True)
+        getattr(model, 'module', model).load_state_dict(dict['model'], strict=True)
         optimizer.load_state_dict(dict['optimizer'])
         print("Restarting from epoch", dict['epoch'])
 
