@@ -25,7 +25,7 @@ import numpy as np
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import AllChem, RemoveHs, AddHs, Descriptors
-from Bio.PDB import PDBParser, PDBIO, Select
+from Bio.PDB import PDBParser, PDBIO, Select, NeighborSearch, Selection
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio import SeqIO
@@ -39,6 +39,20 @@ class NonHetSelect(Select):
     """BioPython selector to remove waters and ligands, keep only protein"""
     def accept_residue(self, residue):
         return residue.id[0] == " "  # Only standard amino acids
+
+
+class PocketSelect(Select):
+    """Select only residues that are part of the binding pocket set."""
+    def __init__(self, pocket_residues):
+        # pocket_residues is a set of tuples (chain_id, residue.id)
+        self.pocket_residues = pocket_residues
+
+    def accept_residue(self, residue):
+        try:
+            chain_id = residue.get_parent().id
+            return (chain_id, residue.id) in self.pocket_residues
+        except Exception:
+            return False
 
 
 def parse_args():
@@ -63,6 +77,10 @@ def parse_args():
                         help="Generate train/val/test splits")
     parser.add_argument("--prepare_esm", action="store_true", default=True,
                         help="Prepare sequences for ESM2 embedding generation")
+    parser.add_argument("--generate_pockets", action="store_true", default=False,
+                        help="Generate pocket.pdb files for each complex (default: off)")
+    parser.add_argument("--pocket_cutoff", type=float, default=6.0,
+                        help="Distance cutoff (Å) to define pocket residues around ligand atoms")
     return parser.parse_args()
 
 
@@ -241,12 +259,18 @@ def extract_protein_sequence(protein_pdb_path: str) -> List[str]:
         return []
 
 
-def create_time_splits(complex_ids: List[str], id_to_year: Dict[str, int], 
+def create_time_splits(processed_complexes: List[str], id_to_year: Dict[str, int], 
                       output_dir: str) -> None:
-    """Create time-based splits based on PDB release year"""
-    
+    """Create time-based splits based on PDB release year.
+
+    Note: This function expects a list of successfully processed complex IDs
+    (e.g. `processed_complexes`) rather than the raw index list. Passing only
+    processed complexes prevents split files from containing IDs that were
+    skipped during processing and aren't present on disk.
+    """
+
     # Filter to processed complexes and sort by year
-    valid_complexes = [(cid, id_to_year.get(cid, 2020)) for cid in complex_ids if cid in id_to_year]
+    valid_complexes = [(cid, id_to_year.get(cid, 2020)) for cid in processed_complexes if cid in id_to_year]
     valid_complexes.sort(key=lambda x: x[1])  # Sort by year
     
     # Time-based splits: train (before 2015), val (2015-2017), test (2018+)
@@ -291,7 +315,7 @@ def prepare_esm_sequences(processed_complexes: List[str], output_dir: str) -> No
     records = []
     
     for complex_id in tqdm(processed_complexes, desc="Extracting sequences"):
-        protein_path = os.path.join(output_dir, complex_id, f"{complex_id}_protein_processed.pdb")
+        protein_path = os.path.join(output_dir, complex_id, f"{complex_id}_protein.pdb")
         if not os.path.exists(protein_path):
             continue
             
@@ -346,6 +370,57 @@ def prepare_esm_sequences(processed_complexes: List[str], output_dir: str) -> No
     print(f"ESM embedding generation script saved to {instruction_path}")
 
 
+def extract_binding_pocket(protein_path: str, ligand_path: str, output_path: str, cutoff: float = 6.0) -> bool:
+    """Extract residues within `cutoff` Å of any ligand atom and write a pocket PDB.
+
+    Returns True on success, False on error (non-fatal for pipeline).
+    """
+    try:
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('prot', protein_path)
+
+        # get all atoms from protein structure
+        atoms = Selection.unfold_entities(structure, 'A')  # list of Atom objects
+
+        # load ligand (RDKit) and get atom coordinates
+        ligand = Chem.MolFromMolFile(ligand_path, removeHs=False)
+        if ligand is None:
+            print(f"Warning: failed to read ligand for pocket extraction: {ligand_path}")
+            return False
+        conf = ligand.GetConformer()
+        if conf is None or conf.GetNumAtoms() == 0:
+            print(f"Warning: ligand has no conformer for pocket extraction: {ligand_path}")
+            return False
+
+        ligand_coords = conf.GetPositions()
+
+        # neighbor search and collect residues
+        ns = NeighborSearch(atoms)
+        pocket_residues = set()
+        for coord in ligand_coords:
+            close_atoms = ns.search(coord, cutoff)
+            for atom in close_atoms:
+                residue = atom.get_parent()
+                chain_id = residue.get_parent().id
+                pocket_residues.add((chain_id, residue.id))
+
+        if len(pocket_residues) == 0:
+            # nothing found; still write an empty file or skip
+            print(f"No pocket residues found within {cutoff}Å for {protein_path} / {ligand_path}")
+            return False
+
+        # write pocket PDB containing only selected residues
+        io = PDBIO()
+        io.set_structure(structure)
+        selector = PocketSelect(pocket_residues)
+        io.save(output_path, selector)
+        return True
+
+    except Exception as e:
+        print(f"Error extracting pocket for {protein_path}: {e}")
+        return False
+
+
 def main():
     args = parse_args()
     
@@ -371,7 +446,9 @@ def main():
     for data_dir in possible_data_dirs:
         if os.path.exists(data_dir):
             # Check if it contains complex directories
-            sample_complexes = [d for d in os.listdir(data_dir) if d in complex_ids[:5]]
+            # compare lowercase names to be robust to uppercase/lowercase directory names
+            wanted_ids = {cid.lower() for cid in complex_ids[:5]}
+            sample_complexes = [d for d in os.listdir(data_dir) if d.lower() in wanted_ids]
             if sample_complexes:
                 pdbbind_data_dir = data_dir
                 break
@@ -408,8 +485,8 @@ def main():
         output_complex_dir = output_dir / complex_id
         output_complex_dir.mkdir(exist_ok=True)
         
-        # Process protein (DiffDock expects: complex_id_protein_processed.pdb)
-        output_protein = output_complex_dir / f"{complex_id}_protein_processed.pdb"
+        # Process protein (DiffDock expects: complex_id_protein.pdb)
+        output_protein = output_complex_dir / f"{complex_id}_protein.pdb"
         if not clean_protein(str(protein_pdb), str(output_protein), args.max_protein_size):
             continue
         
@@ -418,12 +495,29 @@ def main():
         if not process_ligand(str(ligand_mol2), str(output_ligand), 
                              args.min_ligand_size, args.max_ligand_size):
             continue
+
+        # Preserve original MOL2 in output directory for compatibility with other tools
+        try:
+            shutil.copy(str(ligand_mol2), str(output_complex_dir / f"{complex_id}_ligand.mol2"))
+        except Exception as e:
+            print(f"Warning: failed to copy original mol2 for {complex_id}: {e}")
+
+        # Optionally generate pocket.pdb (residues within cutoff Å of ligand atoms)
+        if args.generate_pockets:
+            pocket_path = output_complex_dir / f"{complex_id}_pocket.pdb"
+            try:
+                ok = extract_binding_pocket(str(output_protein), str(output_ligand), str(pocket_path), cutoff=args.pocket_cutoff)
+                if not ok:
+                    # non-fatal; just warn
+                    print(f"Warning: pocket extraction didn't produce a pocket for {complex_id}")
+            except Exception as e:
+                print(f"Warning: pocket extraction failed for {complex_id}: {e}")
         
         # Add to successful processing list
         processed_complexes.append(complex_id)
         metadata_rows.append({
             'complex_id': complex_id,
-            'protein_path': f"{complex_id}/{complex_id}_protein_processed.pdb",
+            'protein_path': f"{complex_id}/{complex_id}_protein.pdb",
             'ligand_path': f"{complex_id}/{complex_id}_ligand.sdf"
         })
     
