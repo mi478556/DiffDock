@@ -75,8 +75,17 @@ def parse_args():
                         help="Number of worker processes")
     parser.add_argument("--generate_splits", action="store_true", default=True,
                         help="Generate train/val/test splits")
-    parser.add_argument("--prepare_esm", action="store_true", default=True,
-                        help="Prepare sequences for ESM2 embedding generation")
+    parser.add_argument("--splits_out", type=str, default="",
+                        help="Optional path to write split files. If empty, splits are written beside the output_dir (sibling 'splits' folder) to avoid placing them inside the dataset output directory.")
+    parser.add_argument("--prepare_esm", action="store_true", default=False,
+                        help="(disabled by default) Prepare sequences for ESM2 embedding generation. Disabled to avoid overlap with datasets/esm_embedding_preparation.py")
+    parser.add_argument("--metadata_out", type=str, default="",
+                        help="Optional path to write metadata CSV. If empty, metadata will not be written to the output directory to avoid overlap with other tooling.")
+    parser.add_argument("--fragment_policy", type=str, default="largest",
+                        choices=["largest", "all", "fail"],
+                        help="How to handle multi-fragment ligands in mol2 files: 'largest' selects the largest fragment (default), 'all' keeps the original molecule, 'fail' rejects multi-fragment ligands.")
+    parser.add_argument("--min_protein_residues", type=int, default=0,
+                        help="Minimum number of standard residues required after protein cleaning. 0 disables this check.")
     parser.add_argument("--generate_pockets", action="store_true", default=False,
                         help="Generate pocket.pdb files for each complex (default: off)")
     parser.add_argument("--pocket_cutoff", type=float, default=6.0,
@@ -135,24 +144,86 @@ def get_complex_ids_from_index(pdbbind_raw_dir: str, subset: str) -> List[str]:
     return complex_ids, id_to_year
 
 
-def clean_protein(protein_pdb_path: str, output_path: str, max_residues: int = 2000) -> bool:
+def clean_protein(protein_pdb_path: str, output_path: str, max_residues: int = 2000, min_residues: int = 0) -> bool:
     """Clean protein structure: remove waters/ligands, keep only standard amino acids"""
     try:
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure("protein", protein_pdb_path)
-        
-        # Count residues first
+
+        # ----- ALTLOC handling: for atoms with the same name in a residue,
+        # keep the atom with highest occupancy or prefer altloc 'A' -----
+        for model in structure:
+            for chain in model:
+                for residue in list(chain):
+                    # build mapping atom_name -> [atoms]
+                    atom_groups = {}
+                    for atom in list(residue):
+                        name = atom.get_name()
+                        atom_groups.setdefault(name, []).append(atom)
+
+                    # for each group, keep best atom and remove others
+                    for name, atoms in atom_groups.items():
+                        if len(atoms) <= 1:
+                            continue
+                        # prefer altloc 'A' if present, otherwise highest occupancy
+                        best = None
+                        best_occ = -1.0
+                        for a in atoms:
+                            try:
+                                alt = a.get_altloc()
+                            except Exception:
+                                alt = ''
+                            try:
+                                occ = a.get_occupancy()
+                            except Exception:
+                                occ = None
+                            if occ is None:
+                                occ = 0.0
+                            if alt == 'A':
+                                best = a
+                                break
+                            if occ > best_occ:
+                                best = a
+                                best_occ = occ
+
+                        for a in atoms:
+                            if a is not best:
+                                try:
+                                    residue.detach_child(a.get_id())
+                                except Exception:
+                                    # best-effort cleanup; ignore failures
+                                    pass
+
+        # ----- Backbone completeness: remove residues that lack CA, N or C -----
+        for model in structure:
+            for chain in model:
+                for residue in list(chain):
+                    atom_names = {atom.get_name() for atom in residue}
+                    if not ({'CA', 'N', 'C'}.issubset(atom_names)):
+                        # remove residue (it may be incomplete/altloc-only)
+                        try:
+                            chain.detach_child(residue.id)
+                        except Exception:
+                            pass
+
+        # Count residues after cleaning
         residue_count = 0
         for model in structure:
             for chain in model:
                 for residue in chain:
                     if residue.id[0] == " ":  # Standard amino acid
                         residue_count += 1
-        
+
+        if residue_count == 0:
+            print(f"Protein has no standard residues after cleaning: {protein_pdb_path}")
+            return False
+        if min_residues and residue_count < min_residues:
+            print(f"Protein too short after cleaning: {residue_count} < min_residues ({min_residues})")
+            return False
         if residue_count > max_residues:
             print(f"Protein too large: {residue_count} > {max_residues} residues")
             return False
-        
+
         # Save cleaned protein
         io = PDBIO()
         io.set_structure(structure)
@@ -165,7 +236,7 @@ def clean_protein(protein_pdb_path: str, output_path: str, max_residues: int = 2
 
 
 def process_ligand(ligand_mol2_path: str, output_sdf_path: str, 
-                  min_atoms: int = 5, max_atoms: int = 100) -> bool:
+                  min_atoms: int = 5, max_atoms: int = 100, fragment_policy: str = "largest") -> bool:
     """Process ligand: convert mol2 to sdf, validate size"""
     try:
         # Read ligand from mol2 file
@@ -173,6 +244,28 @@ def process_ligand(ligand_mol2_path: str, output_sdf_path: str,
         if mol is None:
             print(f"Failed to read ligand: {ligand_mol2_path}")
             return False
+        # Fragment/connectivity handling according to policy
+        try:
+            frags = Chem.GetMolFrags(mol, asMols=True)
+            if len(frags) > 1:
+                if fragment_policy == 'largest':
+                    sizes = [f.GetNumAtoms() for f in frags]
+                    largest_idx = int(max(range(len(frags)), key=lambda i: sizes[i]))
+                    print(f"Warning: ligand file {ligand_mol2_path} contains {len(frags)} fragments; selecting largest fragment with {sizes[largest_idx]} atoms")
+                    mol = frags[largest_idx]
+                    try:
+                        Chem.SanitizeMol(mol)
+                    except Exception:
+                        pass
+                elif fragment_policy == 'fail':
+                    print(f"Rejecting {ligand_mol2_path}: contains multiple fragments and fragment_policy='fail'")
+                    return False
+                elif fragment_policy == 'all':
+                    # keep original mol (no change)
+                    pass
+        except Exception:
+            # if RDKit fragment handling fails for any reason, continue and let later checks catch it
+            pass
         
         # Check size constraints
         heavy_atoms = mol.GetNumHeavyAtoms()
@@ -193,29 +286,12 @@ def process_ligand(ligand_mol2_path: str, output_sdf_path: str,
             
         # Advanced complexity filters for multiprocessing genetic algorithm stability
         from rdkit.Chem import Descriptors
-        
-        # Molecular complexity score (BertzCT) - high values indicate complex topology
-        complexity_score = Descriptors.BertzCT(mol)
-        if complexity_score > 2500:  # 1yet has ~2686, causing issues
-            print(f"Ligand too topologically complex: BertzCT={complexity_score:.0f}")
-            return False
-            
-        # Rotatable bonds - high flexibility can cause conformer generation issues
+
+        # Rotatable bonds - allow more flexible ligands; increased limit to 19
+        # DiffDock handles flexibility, but extremely flexible ligands can still be problematic.
         rotatable_bonds = Descriptors.NumRotatableBonds(mol)
-        if rotatable_bonds > 12:  # 1yet has 12, at the limit
-            print(f"Ligand too flexible: {rotatable_bonds} rotatable bonds")
-            return False
-            
-        # Ring count - complex ring systems can cause genetic algorithm issues
-        num_rings = mol.GetRingInfo().NumRings()
-        if num_rings > 4:
-            print(f"Ligand has too many rings: {num_rings} rings")
-            return False
-            
-        # Molecular weight threshold
-        mol_weight = Descriptors.MolWt(mol)
-        if mol_weight > 550:  # 1yet has ~560
-            print(f"Ligand too heavy: MW={mol_weight:.1f}")
+        if rotatable_bonds > 19:
+            print(f"Ligand too flexible: {rotatable_bonds} rotatable bonds (limit 19)")
             return False
         
         # Add hydrogens and generate conformer if needed
@@ -260,7 +336,7 @@ def extract_protein_sequence(protein_pdb_path: str) -> List[str]:
 
 
 def create_time_splits(processed_complexes: List[str], id_to_year: Dict[str, int], 
-                      output_dir: str) -> None:
+                      output_dir: str, splits_root: Optional[str] = None) -> None:
     """Create time-based splits based on PDB release year.
 
     Note: This function expects a list of successfully processed complex IDs
@@ -281,7 +357,14 @@ def create_time_splits(processed_complexes: List[str], id_to_year: Dict[str, int
     print(f"Time splits: train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
     
     # Write split files
-    splits_dir = os.path.join(output_dir, "splits")
+    # If caller provided an explicit splits_root, use it. Otherwise write splits
+    # to a sibling `splits/` folder next to the `output_dir` to avoid polluting
+    # the processed dataset directory (some downstream tooling expects the
+    # dataset dir to contain only per-complex folders).
+    if splits_root:
+        splits_dir = splits_root
+    else:
+        splits_dir = os.path.join(os.path.dirname(output_dir), "splits")
     os.makedirs(splits_dir, exist_ok=True)
     # Also write files with names that the training code historically expects
     # (e.g. timesplit_no_lig_overlap_train) so users can point --split_train to
@@ -331,43 +414,10 @@ def prepare_esm_sequences(processed_complexes: List[str], output_dir: str) -> No
     SeqIO.write(records, fasta_path, "fasta")
     print(f"Wrote {len(records)} sequences to {fasta_path}")
     
-    # Create instruction file for ESM embedding generation
-    instruction_path = os.path.join(output_dir, "generate_esm_embeddings.sh")
-    with open(instruction_path, 'w') as f:
-        f.write("#!/bin/bash\n")
-        f.write("# Generate ESM2 embeddings for processed PDBBind dataset\n")
-        f.write("# Install ESM first: pip install fair-esm\n\n")
-        f.write(f"python -c \"\n")
-        f.write("import torch\n")
-        f.write("import esm\n")
-        f.write("from Bio import SeqIO\n")
-        f.write("import os\n\n")
-        f.write("# Load ESM2 model\n")
-        f.write("model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()\n")
-        f.write("batch_converter = alphabet.get_batch_converter()\n")
-        f.write("model.eval()\n\n")
-        f.write(f"# Load sequences\n")
-        f.write(f"sequences = []\n")
-        f.write(f"for record in SeqIO.parse('{fasta_path}', 'fasta'):\n")
-        f.write(f"    sequences.append((record.id, str(record.seq)))\n\n")
-        f.write("# Generate embeddings in batches\n")
-        f.write("embeddings = {}\n")
-        f.write("batch_size = 16\n")
-        f.write("for i in range(0, len(sequences), batch_size):\n")
-        f.write("    batch = sequences[i:i+batch_size]\n")
-        f.write("    _, _, batch_tokens = batch_converter(batch)\n")
-        f.write("    with torch.no_grad():\n")
-        f.write("        results = model(batch_tokens, repr_layers=[33], return_contacts=False)\n")
-        f.write("    for j, (seq_id, _) in enumerate(batch):\n")
-        f.write("        embeddings[seq_id] = results['representations'][33][j, 1:-1]  # Remove start/end tokens\n")
-        f.write("    print(f'Processed {min(i+batch_size, len(sequences))}/{len(sequences)} sequences')\n\n")
-        f.write(f"# Save embeddings\n")
-        f.write(f"torch.save(embeddings, '{os.path.join(output_dir, 'esm2_embeddings.pt')}')\n")
-        f.write(f"print('Embeddings saved to esm2_embeddings.pt')\n")
-        f.write("\"\n")
-    
-    os.chmod(instruction_path, 0o755)
-    print(f"ESM embedding generation script saved to {instruction_path}")
+    # Note: we intentionally do not create an instruction shell script here.
+    # The repository includes separate tooling for generating ESM embeddings.
+    # If you need a helper script, generate it externally or re-enable this
+    # behavior manually. This keeps the output directory free of helper files.
 
 
 def extract_binding_pocket(protein_path: str, ligand_path: str, output_path: str, cutoff: float = 6.0) -> bool:
@@ -484,16 +534,23 @@ def main():
         # Create output directory for this complex (DiffDock expects flat structure: complex_id/)
         output_complex_dir = output_dir / complex_id
         output_complex_dir.mkdir(exist_ok=True)
-        
+
         # Process protein (DiffDock expects: complex_id_protein.pdb)
         output_protein = output_complex_dir / f"{complex_id}_protein.pdb"
-        if not clean_protein(str(protein_pdb), str(output_protein), args.max_protein_size):
+        protein_ok = clean_protein(str(protein_pdb), str(output_protein), args.max_protein_size, args.min_protein_residues)
+        if not protein_ok:
+            # Remove any partial output to avoid downstream scripts seeing this complex
+            print(f"Protein processing failed for {complex_id}; removing partial output directory")
+            shutil.rmtree(output_complex_dir, ignore_errors=True)
             continue
-        
+
         # Process ligand (DiffDock expects: complex_id_ligand.sdf)
         output_ligand = output_complex_dir / f"{complex_id}_ligand.sdf"
-        if not process_ligand(str(ligand_mol2), str(output_ligand), 
-                             args.min_ligand_size, args.max_ligand_size):
+        ligand_ok = process_ligand(str(ligand_mol2), str(output_ligand), 
+                                   args.min_ligand_size, args.max_ligand_size, args.fragment_policy)
+        if not ligand_ok:
+            print(f"Ligand processing failed for {complex_id}; removing partial output directory")
+            shutil.rmtree(output_complex_dir, ignore_errors=True)
             continue
 
         # Preserve original MOL2 in output directory for compatibility with other tools
@@ -512,7 +569,7 @@ def main():
                     print(f"Warning: pocket extraction didn't produce a pocket for {complex_id}")
             except Exception as e:
                 print(f"Warning: pocket extraction failed for {complex_id}: {e}")
-        
+
         # Add to successful processing list
         processed_complexes.append(complex_id)
         metadata_rows.append({
@@ -523,31 +580,52 @@ def main():
     
     print(f"Successfully processed {len(processed_complexes)} complexes")
     
-    # Write metadata
-    metadata_path = output_dir / "metadata.csv"
-    with open(metadata_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['complex_id', 'protein_path', 'ligand_path'])
-        writer.writeheader()
-        writer.writerows(metadata_rows)
-    
-    print(f"Metadata written to {metadata_path}")
+    # Write metadata if requested explicitly via --metadata_out (keeps output_dir clean)
+    if args.metadata_out:
+        metadata_path = Path(args.metadata_out)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(metadata_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['complex_id', 'protein_path', 'ligand_path'])
+            writer.writeheader()
+            writer.writerows(metadata_rows)
+        print(f"Metadata written to {metadata_path}")
+        metadata_msg = str(metadata_path)
+    else:
+        print("Skipping writing metadata.csv to output directory (no --metadata_out provided)")
+        metadata_msg = "not written (use --metadata_out to save elsewhere)"
     
     # Generate splits
     if args.generate_splits:
-        create_time_splits(processed_complexes, id_to_year, str(output_dir))
+        # Determine splits output path: prefer explicit --splits_out, otherwise
+        # write to a sibling `splits/` directory beside the dataset output_dir.
+        if args.splits_out:
+            splits_out_path = args.splits_out
+        else:
+            splits_out_path = str(output_dir.parent / "splits")
+        create_time_splits(processed_complexes, id_to_year, str(output_dir), splits_root=splits_out_path)
     
     # Prepare ESM sequences
     if args.prepare_esm:
-        prepare_esm_sequences(processed_complexes, str(output_dir))
+        # This action is intentionally disabled by default to avoid overlap
+        # with `datasets/esm_embedding_preparation.py`. If you really want the
+        # FASTA generated here, set --prepare_esm and then move the file or
+        # incorporate it into your workflow manually. We do not create the
+        # prepared_for_esm.fasta automatically to keep directories clean.
+        print("Note: --prepare_esm was set but FASTA generation is intentionally disabled in this script to avoid overlap with datasets/esm_embedding_preparation.py")
     
     print(f"\n✅ PDBBind processing complete!")
     print(f"📁 Output directory: {output_dir}")
     print(f"📊 Processed complexes: {len(processed_complexes)}")
-    print(f"📝 Metadata: {metadata_path}")
+    print(f"📝 Metadata: {metadata_msg}")
     print("\n🔬 Next steps:")
     print("1. Run the ESM embedding generation script if needed")
     print("2. Test with DiffDock:")
-    print(f"   python train.py --dataset pdbbind --data_dir {output_dir} --split_train {output_dir}/splits/timesplit_train.txt")
+    # Inform user where splits were written
+    if args.generate_splits:
+        splits_display = args.splits_out if args.splits_out else str(output_dir.parent / "splits")
+    else:
+        splits_display = "(no splits generated)"
+    print(f"   python train.py --dataset pdbbind --data_dir {output_dir} --split_train {splits_display}/timesplit_train.txt")
 
 
 if __name__ == "__main__":

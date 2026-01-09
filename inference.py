@@ -183,7 +183,7 @@ def main(args):
     # preprocessing of complexes into geometric graphs
     test_dataset = InferenceDataset(out_dir=args.out_dir, complex_names=complex_name_list, protein_files=protein_path_list,
                                     ligand_descriptions=ligand_description_list, protein_sequences=protein_sequence_list,
-                                    lm_embeddings=True,
+                                    lm_embeddings=getattr(args, 'lm_embeddings', True),
                                     receptor_radius=score_model_args.receptor_radius, remove_hs=score_model_args.remove_hs,
                                     c_alpha_max_neighbors=score_model_args.c_alpha_max_neighbors,
                                     all_atoms=score_model_args.all_atoms, atom_radius=score_model_args.atom_radius,
@@ -197,7 +197,7 @@ def main(args):
         confidence_test_dataset = \
             InferenceDataset(out_dir=args.out_dir, complex_names=complex_name_list, protein_files=protein_path_list,
                              ligand_descriptions=ligand_description_list, protein_sequences=protein_sequence_list,
-                             lm_embeddings=True,
+                             lm_embeddings=getattr(args, 'lm_embeddings', True),
                              receptor_radius=confidence_args.receptor_radius, remove_hs=confidence_args.remove_hs,
                              c_alpha_max_neighbors=confidence_args.c_alpha_max_neighbors,
                              all_atoms=confidence_args.all_atoms, atom_radius=confidence_args.atom_radius,

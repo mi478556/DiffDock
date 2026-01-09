@@ -240,16 +240,52 @@ class PDBBind(Dataset):
             complex_names = complex_names_all[1000*i:1000*(i+1)]
             lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
             complex_graphs, rdkit_ligands = [], []
+            # ensure per-complex cache dir exists
+            per_complex_dir = os.path.join(self.full_cache_path, 'per_complex')
+            os.makedirs(per_complex_dir, exist_ok=True)
+
+            # run workers; workers will write per-complex files and return small name tokens
             if self.num_workers > 1:
                 p = Pool(self.num_workers, maxtasksperchild=1)
                 p.__enter__()
             with tqdm(total=len(complex_names), desc=f'loading complexes {i}/{len(complex_names_all)//1000+1}') as pbar:
                 map_fn = p.imap_unordered if self.num_workers > 1 else map
-                for t in map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names))):
-                    complex_graphs.extend(t[0])
-                    rdkit_ligands.extend(t[1])
-                    pbar.update()
+                if self.num_workers > 1:
+                    gen = map_fn(self.get_complex_worker, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names)))
+                else:
+                    gen = map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names)))
+                saved_names = []
+                for t in gen:
+                    # when using workers, we expect a list of saved names (or empty list) returned
+                    if self.num_workers > 1:
+                        if t:
+                            saved_names.extend(t)
+                            pbar.update(len(t))
+                        else:
+                            pbar.update(1)
+                    else:
+                        complex_graphs.extend(t[0])
+                        rdkit_ligands.extend(t[1])
+                        pbar.update()
             if self.num_workers > 1: p.__exit__(None, None, None)
+
+            # if workers saved per-complex files, load them now into memory and write the batch pkl
+            if self.num_workers > 1:
+                for name in saved_names:
+                    hg_path = os.path.join(per_complex_dir, f"{name}_hg.pt")
+                    lig_path = os.path.join(per_complex_dir, f"{name}_lig.pkl")
+                    try:
+                        hg = torch.load(hg_path)
+                    except Exception:
+                        # try weights_only fallback
+                        hg = torch.load(hg_path, weights_only=False)
+                    complex_graphs.append(hg)
+                    try:
+                        with open(lig_path, 'rb') as lf:
+                            lig = pickle.load(lf)
+                    except Exception:
+                        lig = None
+                    rdkit_ligands.append(lig)
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
@@ -298,21 +334,99 @@ class PDBBind(Dataset):
             ligands_chunk = ligands_list[1000 * i:1000 * (i + 1)]
             lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
             complex_graphs, rdkit_ligands = [], []
+            # ensure per-complex cache dir exists
+            per_complex_dir = os.path.join(self.full_cache_path, 'per_complex')
+            os.makedirs(per_complex_dir, exist_ok=True)
+
             if self.num_workers > 1:
                 p = Pool(self.num_workers, maxtasksperchild=1)
                 p.__enter__()
             with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//1000+1}') as pbar:
                 map_fn = p.imap_unordered if self.num_workers > 1 else map
-                for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
-                    complex_graphs.extend(t[0])
-                    rdkit_ligands.extend(t[1])
-                    pbar.update()
+                if self.num_workers > 1:
+                    gen = map_fn(self.get_complex_worker, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk))
+                else:
+                    gen = map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk))
+                saved_names = []
+                for t in gen:
+                    if self.num_workers > 1:
+                        if t:
+                            saved_names.extend(t)
+                            pbar.update(len(t))
+                        else:
+                            pbar.update(1)
+                    else:
+                        complex_graphs.extend(t[0])
+                        rdkit_ligands.extend(t[1])
+                        pbar.update()
             if self.num_workers > 1: p.__exit__(None, None, None)
+
+            if self.num_workers > 1:
+                for name in saved_names:
+                    hg_path = os.path.join(per_complex_dir, f"{name}_hg.pt")
+                    lig_path = os.path.join(per_complex_dir, f"{name}_lig.pkl")
+                    try:
+                        hg = torch.load(hg_path)
+                    except Exception:
+                        hg = torch.load(hg_path, weights_only=False)
+                    complex_graphs.append(hg)
+                    try:
+                        with open(lig_path, 'rb') as lf:
+                            lig = pickle.load(lf)
+                    except Exception:
+                        lig = None
+                    rdkit_ligands.append(lig)
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
             with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
                 pickle.dump((rdkit_ligands), f)
+
+    def get_complex_worker(self, par):
+        """Worker wrapper: compute complex(s), write per-complex cache files to disk, and return saved names.
+        This avoids sending large HeteroData objects through multiprocessing pipes."""
+        name, lm_embedding_chains, ligand, ligand_description = par
+        try:
+            complex_graphs, rdkit_ligands = self.get_complex(par)
+        except Exception:
+            return []
+        saved = []
+        if not complex_graphs:
+            return []
+        per_complex_dir = os.path.join(self.full_cache_path, 'per_complex')
+        os.makedirs(per_complex_dir, exist_ok=True)
+        for idx, cg in enumerate(complex_graphs):
+            # cg should have attribute 'name' or we fall back to provided name
+            try:
+                cname = cg['name']
+            except Exception:
+                cname = name
+            # atomic save for heterograph
+            hg_tmp = os.path.join(per_complex_dir, f"{cname}_hg.pt.tmp")
+            hg_final = os.path.join(per_complex_dir, f"{cname}_hg.pt")
+            try:
+                torch.save(cg, hg_tmp)
+                os.replace(hg_tmp, hg_final)
+            except Exception:
+                try:
+                    torch.save(cg, hg_final)
+                except Exception:
+                    continue
+            # save ligand (may be None)
+            lig_tmp = os.path.join(per_complex_dir, f"{cname}_lig.pkl.tmp")
+            lig_final = os.path.join(per_complex_dir, f"{cname}_lig.pkl")
+            try:
+                with open(lig_tmp, 'wb') as lf:
+                    pickle.dump((rdkit_ligands[idx] if rdkit_ligands and idx < len(rdkit_ligands) else None), lf)
+                os.replace(lig_tmp, lig_final)
+            except Exception:
+                try:
+                    with open(lig_final, 'wb') as lf:
+                        pickle.dump((rdkit_ligands[idx] if rdkit_ligands and idx < len(rdkit_ligands) else None), lf)
+                except Exception:
+                    pass
+            saved.append(cname)
+        return saved
 
     def check_all_complexes(self):
         if os.path.exists(os.path.join(self.full_cache_path, f"heterographs.pkl")):

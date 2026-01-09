@@ -78,6 +78,7 @@ def parse_train_args():
     parser.add_argument('--train_multiplicity', type=int, default=1, help='')
     parser.add_argument('--val_multiplicity', type=int, default=1, help='')
     parser.add_argument('--max_receptor_size', type=int, default=None, help='')
+    parser.add_argument('--nan_fraction_threshold', type=float, default=0.6, help='Max allowed fraction of NaNs in coords before skipping')
     parser.add_argument('--remove_promiscuous_targets', type=int, default=None, help='')
     parser.add_argument('--min_ligand_size', type=int, default=0, help='')
     parser.add_argument('--unroll_clusters', action='store_true', default=False, help='')
@@ -152,6 +153,7 @@ def parse_train_args():
     parser.add_argument('--vandermers_buffer_residue_num', type=int, default=7, help='')
     parser.add_argument('--vandermers_min_contacts', type=int, default=None, help='')
     parser.add_argument('--remove_second_segment', action='store_true', default=False, help='')
+    parser.add_argument('--load_timeout', type=int, default=600, help='Timeout (s) for loading a single protein during preprocessing')
 
     args = parser.parse_args()
 

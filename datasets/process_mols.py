@@ -2,6 +2,8 @@ import copy
 import warnings
 import numpy as np
 import torch
+import os
+import time
 from Bio.PDB import PDBParser
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
@@ -160,16 +162,27 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
 
 def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cutoff=20, max_neighbors=None, lm_embeddings=None,
                                    knn_only_graph=False, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None):
+    profile = os.environ.get('DIFFDOCK_PROFILE_EXTRACTION', '0') == '1'
+    marks = []
+    def _mark(name):
+        if profile:
+            marks.append((name, time.time()))
+
+    _mark('start')
     chi_angles, one_hot = get_chi_angles(all_coords, seq, return_onehot=True)
+    _mark('after_chi')
     n_rel_pos, c_rel_pos = all_coords[:, 0, :] - all_coords[:, 1, :], all_coords[:, 2, :] - all_coords[:, 1, :]
     side_chain_vecs = torch.from_numpy(np.concatenate([chi_angles / 360, n_rel_pos, c_rel_pos], axis=1))
 
     # Build the k-NN graph
     coords = torch.tensor(all_coords[:, 1, :], dtype=torch.float)
+    _mark('coords_tensor')
     if len(coords) > 3000:
         raise ValueError(f'The receptor is too large {len(coords)}')
     if knn_only_graph:
+        _mark('before_knn')
         edge_index = knn_graph(coords, k=max_neighbors if max_neighbors else 32)
+        _mark('after_knn')
     else:
         distances = cdist(coords, coords)
         src_list = []
@@ -190,6 +203,7 @@ def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cuto
             src_list.extend(src)
             dst_list.extend(dst)
         edge_index = torch.from_numpy(np.asarray([dst_list, src_list]))
+        _mark('after_edge_index')
 
     res_names_list = [aa_short2long[seq[i]] if seq[i] in aa_short2long else 'misc' for i in range(len(seq))]
     feature_list = [[safe_index(allowable_features['possible_amino_acids'], res)] for res in res_names_list]
@@ -200,7 +214,9 @@ def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cuto
     complex_graph['receptor'].pos = coords
     complex_graph['receptor'].side_chain_vecs = side_chain_vecs.float()
     complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = edge_index
+    _mark('graph_built')
     if all_atoms:
+        _mark('all_atoms_start')
         atom_coords = all_coords.reshape(-1, 3)
         atom_coords = torch.from_numpy(atom_coords[~np.any(np.isnan(atom_coords), axis=1)]).float()
 
@@ -237,7 +253,18 @@ def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cuto
         assert len(complex_graph['atom'].x) == len(complex_graph['atom'].pos)
         complex_graph['atom', 'atom_contact', 'atom'].edge_index = atoms_edge_index
         complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
+        _mark('all_atoms_done')
 
+    _mark('end')
+    if profile:
+        # print timing report
+        last = marks[0][1]
+        print('new_extract_receptor_structure timing:')
+        for name, t in marks:
+            print(f'  {name}: {t - last:.6f}s (since prev)')
+            last = t
+        total = marks[-1][1] - marks[0][1]
+        print(f'  TOTAL: {total:.6f}s')
     return
 
 

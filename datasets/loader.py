@@ -3,7 +3,7 @@ from torch_geometric.data import Dataset
 
 from datasets.dataloader import DataLoader, DataListLoader
 from datasets.moad import MOAD
-from datasets.pdb import PDBSidechain
+from datasets.pdb_dataset import PDBSidechain
 from datasets.pdbbind import NoiseTransform, PDBBind
 from utils.utils import read_strings_from_txt
 
@@ -57,8 +57,9 @@ def construct_loader(args, t_to_sigma, device):
                        'vandermers_max_dist': args.vandermers_max_dist,
                        'vandermers_buffer_residue_num': args.vandermers_buffer_residue_num,
                        'vandermers_min_contacts': args.vandermers_min_contacts,
-                       'remove_second_segment': args.remove_second_segment,
-                       'merge_clusters': args.merge_clusters}
+                   'remove_second_segment': args.remove_second_segment,
+                   'merge_clusters': args.merge_clusters}
+        # instantiate PDBSidechain (no load_timeout arg supported)
         train_dataset3 = PDBSidechain(cache_path=args.cache_path, split='train', multiplicity=args.train_multiplicity, **common_args)
 
         if args.dataset == 'pdbsidechain':

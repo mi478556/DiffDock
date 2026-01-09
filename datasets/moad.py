@@ -300,7 +300,29 @@ class MOAD(Dataset):
             sequences_list = read_strings_from_txt(self.esm_embeddings_sequences_path)
             sequences_to_embeddings = {}
             for i, seq in enumerate(sequences_list):
-                sequences_to_embeddings[seq] = id_to_embeddings[str(i)]
+                # support embeddings saved with string keys ('0','1',...) or integer keys (0,1,...)
+                key_str = str(i)
+                emb = None
+                # try canonical lookup by sequence (preferred)
+                if seq in id_to_embeddings:
+                    emb = id_to_embeddings[seq]
+                elif seq.encode('utf-8') in id_to_embeddings:
+                    emb = id_to_embeddings[seq.encode('utf-8')]
+                # fallback to numeric/indexed keys
+                elif key_str in id_to_embeddings:
+                    emb = id_to_embeddings[key_str]
+                elif i in id_to_embeddings:
+                    emb = id_to_embeddings[i]
+                else:
+                    # sometimes keys may be bytes of the numeric string
+                    try:
+                        kb = key_str.encode('utf-8')
+                        if kb in id_to_embeddings:
+                            emb = id_to_embeddings[kb]
+                    except Exception:
+                        pass
+                if emb is not None:
+                    sequences_to_embeddings[seq] = emb
 
         else:
             sequences_to_embeddings = None
@@ -541,7 +563,10 @@ def print_statistics(dataset):
     print('Number of complexes: ', len(dataset))
     for i in range(len(name)):
         array = np.asarray(statistics[i])
-        print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
+        if array.size == 0:
+            print(f"{name[i]}: mean nan, std nan, max nan (no data)")
+        else:
+            print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
 
     return
 

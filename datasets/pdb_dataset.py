@@ -1,13 +1,20 @@
 # Significant contribution from Ben Fry
 
 import copy
+import os
 import os.path
 import pickle
 import random
+import gc
+# Used ONLY for vandermers computation. Do NOT use for preprocessing.
 from multiprocessing import Pool
+from itertools import repeat
 
 import numpy as np
 import pandas as pd
+# Prevent dataset worker processes from initializing CUDA when using forked multiprocessing.
+# This makes dataset workers CUDA-agnostic and avoids hangs caused by CUDA context in child processes.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import torch
 from rdkit import Chem
 from rdkit.Chem import AllChem, MolFromSmiles
@@ -16,11 +23,23 @@ from torch_geometric.data import Dataset, HeteroData
 from torch_geometric.utils import subgraph
 from tqdm import tqdm
 
+import time
+
 from datasets.constants import aa_to_cg_indices, amino_acid_smiles, cg_rdkit_indices
 from datasets.parse_chi import aa_long2short, atom_order
 from datasets.process_mols import new_extract_receptor_structure, get_lig_graph, generate_conformer
 from utils.torsion import get_transformation_mask
 
+
+def _vandermers_init(coords_map, seq_map):
+    """Initializer for worker processes computing vandermers.
+
+    Sets module-global read-only maps so workers can access them without
+    relying on forked memory sharing semantics.
+    """
+    global coords_by_name, seq_by_name
+    coords_by_name = coords_map
+    seq_by_name = seq_map
 
 def read_strings_from_txt(path):
     # every line will be one element of the returned list
@@ -64,46 +83,60 @@ def compute_num_ca_neighbors(coords, cg_coords, idx, is_valid_bb_node, max_dist=
     return len(bb_idces_within_thresh)
 
 
-def identify_valid_vandermers(args):
+def identify_valid_vandermers_raw(args):
     """
-    Constructs a tensor containing all the number of contacts for each residue that can be sampled from for chemical groups.
-    By using every sidechain as a chemical group, we will load the actual chemical groups at training time.
-    These can be used to sample as probabilities once divided by the sum.
-    """
-    complex_graph, max_dist, buffer_residue_num = args
+    Worker-safe variant that accepts very lightweight arguments:
+    (name, max_dist, buffer_residue_num)
 
-    # Constructs a mask tracking whether index is a valid coordinate frame / residue label to train over.
-    #is_in_residue_vocabulary = torch.tensor([x in aa_short2long for x in data['seq']]).bool()
-    coords, seq = complex_graph.coords, complex_graph.seq
-    is_valid_bb_node = (coords[:, :4].isnan().sum(dim=(1,2)) == 0).bool() #* is_in_residue_vocabulary
+    The heavy per-protein data (`coords` and `seq`) are read from module-level
+    read-only dictionaries `coords_by_name` and `seq_by_name` which must be
+    created before the Pool is spawned. This relies on copy-on-write semantics
+    of forked processes to avoid IPC copying.
+    Returns (name, numpy_array_of_counts) or None on failure.
+    """
+    name, max_dist, buffer_residue_num = args
+
+    # Read data from the shared, read-only maps populated by the parent before forking.
+    coords_np = coords_by_name.get(name)
+    seq = seq_by_name.get(name)
+    if coords_np is None or seq is None:
+        return None
+
+    coords = torch.from_numpy(coords_np)
+    is_valid_bb_node = (coords[:, :4].isnan().sum(dim=(1, 2)) == 0).bool()
 
     valid_cg_idces = []
     for idx, aa in enumerate(seq):
-
         if aa not in aa_to_cg_indices:
             valid_cg_idces.append(0)
-        else:
-            indices = aa_to_cg_indices[aa]
-            cg_coordinates = coords[idx][indices]
+            continue
 
-            # remove chemical group residues that aren't fully resolved.
-            if torch.any(cg_coordinates.isnan()).item():
-                valid_cg_idces.append(0)
-                continue
+        indices = aa_to_cg_indices[aa]
+        cg_coordinates = coords[idx][indices]
 
-            nbr_count = compute_num_ca_neighbors(coords, cg_coordinates, idx, is_valid_bb_node,
-                                                 max_dist=max_dist, buffer_residue_num=buffer_residue_num)
-            valid_cg_idces.append(nbr_count)
+        # remove chemical group residues that aren't fully resolved.
+        if torch.any(cg_coordinates.isnan()).item():
+            valid_cg_idces.append(0)
+            continue
 
-    return complex_graph.name, torch.tensor(valid_cg_idces)
+        nbr_count = compute_num_ca_neighbors(coords, cg_coordinates, idx, is_valid_bb_node,
+                                             max_dist=max_dist, buffer_residue_num=buffer_residue_num)
+        valid_cg_idces.append(nbr_count)
+
+    return name, np.asarray(valid_cg_idces, dtype=np.int16)
 
 
 def fast_identify_valid_vandermers(coords, seq, max_dist=5, buffer_residue_num=7):
-
     offset = 10000 + max_dist
-    R = coords.shape[0]
 
-    coords = coords.numpy().reshape(-1, 3)
+    # Accept either torch.Tensor or np.ndarray
+    if hasattr(coords, "numpy"):
+        coords = coords.numpy()
+    else:
+        coords = np.asarray(coords)
+
+    R = coords.shape[0]
+    coords = coords.reshape(-1, 3)
     pdist_mat = squareform(pdist(coords))
     pdist_mat = pdist_mat.reshape((R, 14, R, 14))
     pdist_mat = np.nan_to_num(pdist_mat, nan=offset)
@@ -116,7 +149,47 @@ def fast_identify_valid_vandermers(coords, seq, max_dist=5, buffer_residue_num=7
 
     # get number of residues that are within max_dist of each other
     nbr_count = np.sum(pdist_mat < max_dist, axis=1)
-    return torch.tensor(nbr_count)
+    return np.asarray(nbr_count, dtype=np.int32)
+
+
+def identify_valid_vandermers_fast_raw(args):
+    """
+    Torch-free worker using NumPy + SciPy only.
+    Accepts (name, max_dist, buffer_residue_num) and reads coords_by_name
+    and seq_by_name populated by the parent before forking.
+    FAIL-FAST: any error aborts the entire job.
+    """
+    name, max_dist, buffer_residue_num = args
+
+    coords = coords_by_name.get(name)
+    seq = seq_by_name.get(name)
+    if coords is None or seq is None:
+        raise RuntimeError(f"Missing coords or seq for {name}")
+
+    counts = fast_identify_valid_vandermers(
+        coords,
+        seq,
+        max_dist=max_dist,
+        buffer_residue_num=buffer_residue_num,
+    )
+
+    if counts is None:
+        raise RuntimeError(f"fast_identify_valid_vandermers returned None for {name}")
+
+    counts = np.asarray(counts, dtype=np.int16)
+
+    if counts.ndim != 1 or counts.shape[0] != len(seq):
+        raise RuntimeError(
+            f"Invalid vandermers shape for {name}: {counts.shape}, expected ({len(seq)},)"
+        )
+
+    return name, counts
+
+
+# Note: the NumPy-only fast worker was removed to preserve original
+# torch-based semantics in workers. Use `identify_valid_vandermers_raw`
+# which converts NumPy coords to torch inside the worker and calls
+# the original helpers.
 
 
 def compute_cg_features(aa, aa_smile):
@@ -196,7 +269,7 @@ class PDBSidechain(Dataset):
         filtered_proteins = []
         if vandermers_extraction:
             for complex_graph in tqdm(self.protein_graphs):
-                if complex_graph.name in self.vandermers and torch.any(self.vandermers[complex_graph.name] >= 10):
+                if complex_graph.name in self.vandermers and torch.any(self.vandermers[complex_graph.name] >= self.vandermers_min_contacts):
                     filtered_proteins.append(complex_graph)
             print(f"Computed vandermers and kept {len(filtered_proteins)} proteins out of {len(self.protein_graphs)}")
         else:
@@ -335,20 +408,13 @@ class PDBSidechain(Dataset):
         if self.add_random_ligand:
             if smiles is not None:
                 mol = MolFromSmiles(smiles)
-                try:
-                    generate_conformer(mol)
-                except Exception as e:
-                    print("failed to generate the given ligand returning None", e)
-                    return None
+                generate_conformer(mol)
             else:
                 success = False
                 while not success:
                     smiles = random.choice(self.smiles_list)
                     mol = MolFromSmiles(smiles)
-                    try:
-                        success = not generate_conformer(mol)
-                    except Exception as e:
-                        print(e, "changing ligand")
+                    success = not generate_conformer(mol)
 
             lig_graph = HeteroData()
             get_lig_graph(mol, lig_graph)
@@ -363,7 +429,7 @@ class PDBSidechain(Dataset):
                 for key, value in lig_graph[type].items():
                     protein_graph[type][key] = value
 
-        for a in ['random_coords', 'coords', 'seq', 'sequence', 'mask', 'rmsd_matching', 'cluster', 'orig_seq', 'to_keep', 'chain_ids']:
+        for a in ['random_coords', 'coords', 'sequence', 'mask', 'rmsd_matching', 'cluster', 'orig_seq', 'to_keep', 'chain_ids']:
             if hasattr(protein_graph, a):
                 delattr(protein_graph, a)
             if hasattr(protein_graph['receptor'], a):
@@ -418,9 +484,8 @@ class PDBSidechain(Dataset):
         print(f'Loading {len(self.chains_in_cluster)} protein graphs.')
         list_indices = list(range(len(self.chains_in_cluster) // 10000 + 1))
         random.shuffle(list_indices)
-        for i in list_indices:
+        for i in tqdm(list_indices, desc="load cached protein_graphs", unit="batch"):
             with open(os.path.join(self.cache_path, f"protein_graphs{i}.pkl"), 'rb') as f:
-                print(i)
                 l = pickle.load(f)
                 total_recovered += len(l)
                 self.protein_graphs.extend(l)
@@ -435,95 +500,144 @@ class PDBSidechain(Dataset):
                 continue
 
             vandermers = {}
-            if self.num_workers > 1:
-                p = Pool(self.num_workers, maxtasksperchild=1)
-                p.__enter__()
-            with tqdm(total=len(l), desc=f'computing vandermers {i}') as pbar:
-                map_fn = p.imap_unordered if self.num_workers > 1 else map
-                arguments = zip(l, [self.vandermers_max_dist] * len(l),
-                                [self.vandermers_buffer_residue_num] * len(l))
-                for t in map_fn(identify_valid_vandermers, arguments):
-                    if t is not None:
-                        vandermers[t[0]] = t[1]
-                    pbar.update()
-            if self.num_workers > 1: p.__exit__(None, None, None)
+            # Create read-only maps for coords and seqs before forking so children inherit
+            # them via copy-on-write (no IPC copying). Do NOT mutate these while the pool is alive.
+            global coords_by_name, seq_by_name
+            coords_by_name = {g.name: g.coords.numpy() for g in l}
+            seq_by_name = {g.name: g.seq for g in l}
 
+            # prepare lightweight argument tuples (name, max_dist, buffer)
+            arguments = ((g.name, self.vandermers_max_dist, self.vandermers_buffer_residue_num) for g in l)
+
+            if self.num_workers > 1:
+                # use an initializer to populate worker globals reliably across start methods
+                with Pool(self.num_workers, initializer=_vandermers_init, initargs=(coords_by_name, seq_by_name)) as p:
+                    with tqdm(total=len(l), desc=f'computing vandermers {i}') as pbar:
+                        # fail-fast: let worker exceptions propagate; use chunksize=1 to surface failures quickly
+                        for name, counts in p.imap_unordered(identify_valid_vandermers_fast_raw, arguments, chunksize=1):
+                            vandermers[name] = counts
+                            pbar.update()
+            else:
+                with tqdm(total=len(l), desc=f'computing vandermers {i}') as pbar:
+                    for name, counts in map(identify_valid_vandermers_fast_raw, arguments):
+                        vandermers[name] = counts
+                        pbar.update()
+
+            # Convert numpy arrays to torch tensors after the pool has shut down
+            # Fail-fast on any conversion error so issues surface loudly.
+            for k, v in list(vandermers.items()):
+                vandermers[k] = torch.from_numpy(v)
+
+            t0 = time.time()
             with open(os.path.join(self.cache_path, f'vandermers{i}_{self.vandermers_max_dist}_{self.vandermers_buffer_residue_num}.pkl'), 'wb') as f:
                 pickle.dump(vandermers, f)
+            print(f"Saved vandermers batch {i}: {len(vandermers)} items -> {os.path.join(self.cache_path, f'vandermers{i}_{self.vandermers_max_dist}_{self.vandermers_buffer_residue_num}.pkl')} in {time.time()-t0:.1f}s")
             self.vandermers.update(vandermers)
 
         print(f"Kept {len(self.protein_graphs)} proteins out of {len(self.chains_in_cluster)} total")
         return
 
     def preprocess(self):
-        # running preprocessing in parallel on multiple workers and saving the progress every 10000 proteins
+        # Preprocess in batches. Load raw files in worker-safe manner, then build graphs
+        # in the parent process to avoid CUDA/tensor ownership issues in forked workers.
         list_indices = list(range(len(self.chains_in_cluster) // 10000 + 1))
         random.shuffle(list_indices)
-        for i in list_indices:
-            if os.path.exists(os.path.join(self.cache_path, f"protein_graphs{i}.pkl")):
-                continue
-            chains_names = self.chains_in_cluster[10000 * i:10000 * (i + 1)]
-            protein_graphs = []
-            if self.num_workers > 1:
-                p = Pool(self.num_workers, maxtasksperchild=1)
-                p.__enter__()
-            with tqdm(total=len(chains_names),
-                      desc=f'loading protein batch {i}/{len(self.chains_in_cluster) // 10000 + 1}') as pbar:
-                map_fn = p.imap_unordered if self.num_workers > 1 else map
-                for t in map_fn(self.load_chain, chains_names):
-                    if t is not None:
-                        protein_graphs.append(t)
-                    pbar.update()
-            if self.num_workers > 1: p.__exit__(None, None, None)
 
-            with open(os.path.join(self.cache_path, f"protein_graphs{i}.pkl"), 'wb') as f:
+        for i in tqdm(list_indices, desc="preprocess batches", unit="batch"):
+            out_path = os.path.join(self.cache_path, f"protein_graphs{i}.pkl")
+            if os.path.exists(out_path):
+                continue
+
+            chains = self.chains_in_cluster[10000 * i:10000 * (i + 1)]
+
+            print(f"Loading batch {i}, {len(chains)} chains")
+
+            # Load raw records sequentially in parent process (CPU-only)
+            raws = self.load_chain_batch(chains, desc=f"load raw batch {i}")
+
+            protein_graphs = []
+            for raw in tqdm(raws, desc=f"build graphs batch {i}", unit="prot", leave=False):
+                protein_graphs.append(self.build_graph_from_raw(raw))
+
+            # Save with timing to help diagnose slow HDD writes
+            t0 = time.time()
+            with open(out_path, "wb") as f:
                 pickle.dump(protein_graphs, f)
+            print(f"Saved batch {i}: {len(protein_graphs)} graphs -> {out_path} in {time.time()-t0:.1f}s")
+
+            # explicit cleanup
+            del raws
+            del protein_graphs
+            gc.collect()
 
         print("Finished preprocessing and saving protein graphs")
 
-    def load_chain(self, c):
-        chain, cluster = c
-        if not os.path.exists(self.root + f"/pdb/{chain[1:3]}/{chain}.pt"):
-            print("File not found", chain)
-            return None
+    def load_chain_batch(self, chains, desc=None):
+        """Load raw data for a batch of chains.
 
-        data = torch.load(self.root + f"/pdb/{chain[1:3]}/{chain}.pt")
+        Runs in the parent process.
+        Returns only plain Python objects and NumPy arrays.
+        Must not create torch tensors or HeteroData objects.
+        """
+        raws = []
+        it = tqdm(chains, desc=desc or "loading raw chains", unit="chain", leave=False)
+        for chain, cluster in it:
+            path = self.root + f"/pdb/{chain[1:3]}/{chain}.pt"
+            if not os.path.exists(path):
+                # missing file; skip
+                continue
+
+            data = torch.load(path, map_location="cpu")
+
+            orig_seq = data.get("seq")
+            coords = data.get("xyz")
+            mask = data.get("mask")
+
+            # remove residues with NaN backbone coordinates
+            to_keep = ~torch.any(torch.isnan(coords[:, :4, 0]), dim=1)
+            if not to_keep.any():
+                continue
+
+            coords_np = coords[to_keep].numpy().astype("float32")
+            mask_np = mask[to_keep].numpy()
+            seq = "".join(np.asarray(list(orig_seq))[to_keep.numpy()].tolist())
+
+            raws.append({
+                "chain": chain,
+                "cluster": cluster,
+                "seq": seq,
+                "coords": coords_np,
+                "mask": mask_np,
+                "orig_seq": orig_seq,
+                "to_keep": to_keep.numpy(),
+            })
+
+        return raws
+
+    def build_graph_from_raw(self, raw):
+        """Construct HeteroData graph from a raw record. Runs in parent process only."""
         complex_graph = HeteroData()
-        complex_graph['name'] = chain
-        orig_seq = data["seq"]
-        coords = data["xyz"]
-        mask = data["mask"].bool()
+        complex_graph["name"] = raw["chain"]
 
-        # remove residues with NaN backbone coordinates
-        to_keep = torch.logical_not(torch.any(torch.isnan(coords[:, :4, 0]), dim=1))
-        coords = coords[to_keep]
-        seq = ''.join(np.asarray(list(orig_seq))[to_keep.numpy()].tolist())
-        mask = mask[to_keep]
+        new_extract_receptor_structure(
+            raw["seq"],
+            raw["coords"],
+            complex_graph=complex_graph,
+            neighbor_cutoff=self.receptor_radius,
+            max_neighbors=self.c_alpha_max_neighbors,
+            knn_only_graph=self.knn_only_graph,
+            all_atoms=self.all_atoms,
+            atom_cutoff=self.atom_radius,
+            atom_max_neighbors=self.atom_max_neighbors,
+        )
 
-        if len(coords) == 0:
-            print("All coords were NaN", chain)
-            return None
+        complex_graph.seq = raw["seq"]
+        complex_graph.coords = torch.from_numpy(raw["coords"]) 
+        complex_graph.mask = torch.from_numpy(raw["mask"]).bool()
+        complex_graph.cluster = raw["cluster"]
+        complex_graph.orig_seq = raw["orig_seq"]
+        complex_graph.to_keep = torch.from_numpy(raw["to_keep"]).bool()
 
-        try:
-            new_extract_receptor_structure(seq, coords.numpy(), complex_graph=complex_graph, neighbor_cutoff=self.receptor_radius,
-                                           max_neighbors=self.c_alpha_max_neighbors, knn_only_graph=self.knn_only_graph,
-                                           all_atoms=self.all_atoms, atom_cutoff=self.atom_radius,
-                                           atom_max_neighbors=self.atom_max_neighbors)
-        except Exception as e:
-            print("Error in extracting receptor", chain)
-            print(e)
-            return None
-
-        if torch.any(torch.isnan(complex_graph['receptor'].pos)):
-            print("NaN in pos receptor", chain)
-            return None
-
-        complex_graph.coords = coords
-        complex_graph.seq = seq
-        complex_graph.mask = mask
-        complex_graph.cluster = cluster
-        complex_graph.orig_seq = orig_seq
-        complex_graph.to_keep = to_keep
         return complex_graph
 
 

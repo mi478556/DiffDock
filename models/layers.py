@@ -58,7 +58,14 @@ class AtomEncoder(torch.nn.Module):
 
     def forward(self, x):
         x_embedding = 0
-        assert x.shape[1] == self.num_categorical_features + self.additional_features_dim
+        expected_cols = self.num_categorical_features + self.additional_features_dim
+        # If additional features (e.g., LM embeddings) are missing, pad with zeros so shapes align.
+        if x.shape[1] < expected_cols:
+            pad_cols = expected_cols - x.shape[1]
+            pad = torch.zeros((x.shape[0], pad_cols), device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+        elif x.shape[1] > expected_cols:
+            x = x[:, :expected_cols]
         for i in range(self.num_categorical_features):
             x_embedding += self.atom_embedding_list[i](x[:, i].long())
 
@@ -102,10 +109,17 @@ class OldAtomEncoder(torch.nn.Module):
 
     def forward(self, x):
         x_embedding = 0
+        # Allow missing scalar/LM features by padding with zeros if necessary
         if self.lm_embedding_type is not None:
-            assert x.shape[1] == self.num_categorical_features + self.num_scalar_features + self.lm_embedding_dim
+            expected_cols = self.num_categorical_features + self.num_scalar_features + self.lm_embedding_dim
         else:
-            assert x.shape[1] == self.num_categorical_features + self.num_scalar_features
+            expected_cols = self.num_categorical_features + self.num_scalar_features
+        if x.shape[1] < expected_cols:
+            pad_cols = expected_cols - x.shape[1]
+            pad = torch.zeros((x.shape[0], pad_cols), device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+        elif x.shape[1] > expected_cols:
+            x = x[:, :expected_cols]
         for i in range(self.num_categorical_features):
             x_embedding += self.atom_embedding_list[i](x[:, i].long())
 

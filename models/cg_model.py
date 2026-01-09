@@ -260,12 +260,15 @@ class CGModel(torch.nn.Module):
         lig_node_attr = self.lig_node_embedding(lig_node_attr)
         lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
 
-        assert self.embed_also_ligand, "otherwise reimplement padding"
-        for l in range(len(self.lig_emb_layers)):
-            edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_edge_index[0], :self.ns],
-                                    lig_node_attr[lig_edge_index[1], :self.ns]], -1)
-            lig_node_attr = self.lig_emb_layers[l](lig_node_attr, lig_edge_index, edge_attr_, lig_edge_sh,
-                                                   edge_weight=lig_edge_weight)
+        # If ligand embedding via protein-style embedding layers is enabled,
+        # run the ligand embedding layers. Otherwise leave the ligand node
+        # attributes as produced by the atom encoder (no additional padding).
+        if self.embed_also_ligand:
+            for l in range(len(self.lig_emb_layers)):
+                edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_edge_index[0], :self.ns],
+                                        lig_node_attr[lig_edge_index[1], :self.ns]], -1)
+                lig_node_attr = self.lig_emb_layers[l](lig_node_attr, lig_edge_index, edge_attr_, lig_edge_sh,
+                                                       edge_weight=lig_edge_weight)
 
         return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight
 

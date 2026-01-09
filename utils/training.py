@@ -2,6 +2,7 @@ import copy
 import numpy as np
 from rdkit.Chem import RemoveAllHs
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch
 from tqdm import tqdm
 import torch
 
@@ -77,7 +78,12 @@ def loss_function(
             edge_tor_sigma = torch.from_numpy(edge_tor_arr)
             tor_score = torch.cat([d.tor_score for d in data], dim=0).to(pred_device)
         else:
-            edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge)
+            # When using a Batched object, some fields (like tor_sigma_edge) may still be lists
+            if isinstance(data.tor_sigma_edge, list):
+                edge_tor_arr = np.concatenate(data.tor_sigma_edge)
+                edge_tor_sigma = torch.from_numpy(edge_tor_arr)
+            else:
+                edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge)
             tor_score = data.tor_score.to(pred_device)
 
         tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float().to(pred_device)
@@ -146,14 +152,20 @@ class AverageMeter():
 
     def summary(self):
         if self.intervals == 1:
+            if self.count == 0:
+                return {k: 0.0 for k in self.types}
             out = {k: v.item() / self.count for k, v in self.acc.items()}
             return out
         else:
             out = {}
             for i in range(self.intervals):
                 for type_idx, k in enumerate(self.types):
-                    out['int' + str(i) + '_' + k] = (
-                            list(self.acc.values())[type_idx][i] / self.count[type_idx][i]).item()
+                    cnt = self.count[type_idx][i]
+                    if cnt == 0:
+                        out['int' + str(i) + '_' + k] = 0.0
+                    else:
+                        out['int' + str(i) + '_' + k] = (
+                            list(self.acc.values())[type_idx][i] / cnt).item()
             return out
 
 
@@ -163,11 +175,24 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
 
     for data in tqdm(loader, total=len(loader)):
-        if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
-            print("Skipping batch of size 1 since otherwise batchnorm would not work.")
-            continue
+        # determine if this is a single-example batch (support list or Batch)
+        if isinstance(data, list):
+            single_batch = len(data) == 1
+        else:
+            single_batch = getattr(data, 'num_graphs', 1) == 1
+
+        if single_batch:
+            # only skip if the model actually contains BatchNorm modules
+            has_bn = any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in model.modules())
+            if has_bn:
+                print("Skipping batch of size 1 since otherwise batchnorm would not work.")
+                continue
         optimizer.zero_grad()
-        data = [d.to(device) for d in data] if device.type == 'cuda' else data
+        # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
+        if isinstance(data, list):
+            data = Batch.from_data_list(data)
+        # move the whole batch to device (keep as a Batch), so model.forward receives the expected object
+        data = data.to(device) if device.type == 'cuda' else data
         try:
             tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device)

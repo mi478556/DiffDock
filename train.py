@@ -234,16 +234,25 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
 def main_function():
     args = parse_train_args()
-    if args.config:
-        config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
+    # Load config from file if provided. Support argparse FileType or a string path.
+    if getattr(args, 'config', None):
+        # args.config may be an open file (argparse.FileType) or a path string
+        if hasattr(args.config, 'read'):
+            config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
+            config_name = getattr(args.config, 'name', None)
+        else:
+            # treat as path-like
+            with open(str(args.config), 'r') as cf:
+                config_dict = yaml.load(cf, Loader=yaml.FullLoader)
+            config_name = str(args.config)
         arg_dict = args.__dict__
-        for key, value in config_dict.items():
-            if isinstance(value, list):
+        for key, value in (config_dict or {}).items():
+            if isinstance(value, list) and key in arg_dict and isinstance(arg_dict[key], list):
                 for v in value:
                     arg_dict[key].append(v)
             else:
                 arg_dict[key] = value
-        args.config = args.config.name
+        args.config = config_name
     assert (args.inference_earlystop_goal == 'max' or args.inference_earlystop_goal == 'min')
     if args.val_inference_freq is not None and args.scheduler is not None:
         assert (args.scheduler_patience > args.val_inference_freq) # otherwise we will just stop training after args.scheduler_patience epochs
