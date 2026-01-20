@@ -6,6 +6,11 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from tqdm import tqdm
 from Bio import SeqIO
+import warnings
+from Bio.PDB.PDBExceptions import PDBConstructionWarning
+
+# Silence noisy PDB construction warnings during bulk parsing
+warnings.filterwarnings("ignore", category=PDBConstructionWarning)
 
 from datasets.constants import three_to_one
 

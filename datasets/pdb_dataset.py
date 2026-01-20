@@ -557,7 +557,14 @@ class PDBSidechain(Dataset):
 
             protein_graphs = []
             for raw in tqdm(raws, desc=f"build graphs batch {i}", unit="prot", leave=False):
-                protein_graphs.append(self.build_graph_from_raw(raw))
+                try:
+                    g = self.build_graph_from_raw(raw)
+                except Exception:
+                    # Skip this chain (preserve original load_chain semantics)
+                    continue
+
+                if g is not None:
+                    protein_graphs.append(g)
 
             # Save with timing to help diagnose slow HDD writes
             t0 = time.time()
