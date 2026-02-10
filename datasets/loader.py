@@ -85,9 +85,7 @@ def construct_loader(args, t_to_sigma, device):
                                     num_conformers=args.num_conformers, root=args.pdbbind_dir,
                                     esm_embeddings_path=args.pdbbind_esm_embeddings_path,
                                     protein_file=args.protein_file, **common_args)
-            # Hard-stop experiment: ensure PDBBind preprocessing and its workers finish, then exit.
-            print("[EXPERIMENT] PDBBind preprocessing finished; exiting intentionally.")
-            sys.exit(0)
+            
 
         if args.dataset == 'moad' or args.combined_training:
             train_dataset2 = MOAD(cache_path=args.cache_path, split='train', keep_original=True,
