@@ -1,6 +1,6 @@
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-# Set threadpool env vars early to avoid oversubscription when numpy/torch import
+                                                                                 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -8,7 +8,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import multiprocessing as mp
 import signal
 
-# Ensure fork start method is set on import (idempotent; harmless if already set)
+                                                                                 
 try:
     mp.set_start_method("fork", force=False)
 except RuntimeError:
@@ -25,7 +25,7 @@ import time
 
 
 class PreprocessHealthError(RuntimeError):
-    """Raised when preprocessing health constraints are violated."""
+
     pass
 
 
@@ -105,11 +105,9 @@ from datasets.process_mols import (
 from utils.diffusion_utils import modify_conformer, set_time
 from utils.utils import read_strings_from_txt, crop_beyond
 from utils import so3, torus
+from utils.torsion import get_transformation_mask
 
 
-# ----------------------
-# Worker globals and helpers
-# ----------------------
 _WORKER_CFG = {}
 
 
@@ -117,7 +115,7 @@ def _worker_init(cfg):
     global _WORKER_CFG
     _WORKER_CFG = cfg
 
-    # Ensure workers do not try to use CUDA or oversubscribe threads
+                                                                    
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -125,7 +123,7 @@ def _worker_init(cfg):
 
 
 def _rdkit_mol_to_bytes(mol):
-    # Use stable pickle serialization for RDKit Mol objects (works across RDKit builds)
+                                                                                       
     return pickle.dumps(mol, protocol=pickle.HIGHEST_PROTOCOL)
 
 
@@ -145,17 +143,23 @@ def _process_one_complex(task):
     name, lm = task
     cfg = _WORKER_CFG
 
-    # Reconstruct LM embeddings into tensors inside worker to avoid crossing
-    # Torch tensors across process boundaries (parent sends NumPy arrays).
+                                                                            
     if lm is not None:
         try:
             lm = [torch.from_numpy(x) for x in lm]
         except Exception:
-            # If conversion fails, leave lm as-is and let downstream code handle it
+                                                                                   
             pass
 
+                                    
+    try:
+        if cfg.get("esm_embeddings_enabled", False) and lm is None:
+            return False, "skip_missing_esm_embeddings"
+    except Exception:
+        pass
+
     timeout_s = cfg.get("per_complex_timeout_s", None)
-    # SIGALRM only available on POSIX; disable timeout on other OSes
+                                                                    
     if os.name != "posix":
         timeout_s = None
     if timeout_s and timeout_s > 0:
@@ -194,7 +198,7 @@ def _process_one_complex(task):
             return False, "skip_ligand_too_large"
 
         cg = HeteroData()
-        cg["name"] = name
+        cg.name = name
 
         try:
             get_lig_graph_with_matching(
@@ -239,7 +243,7 @@ def _process_one_complex(task):
                 cg["ligand"].pos -= center
 
             cg.original_center = center
-            cg["receptor_name"] = name
+            cg.receptor_name = name
         except Exception:
             return False, "skip_postprocess_fail"
 
@@ -255,11 +259,6 @@ def _process_one_complex(task):
         if timeout_s and timeout_s > 0:
             signal.alarm(0)
 
-
-
-# ============================================================
-# Dataset health / skip-rate monitor
-# ============================================================
 
 class PreprocessHealthMonitor:
     def __init__(
@@ -362,23 +361,12 @@ class PreprocessHealthMonitor:
             except Exception:
                 pass
 
-        # Raise a typed exception so callers (and external runners) can handle
-        # health failures without relying on SystemExit semantics.
+                                                                              
         raise PreprocessHealthError(report)
 
 
-# ============================================================
-# Preprocessing watchdog
-# ============================================================
-
-
 class PreprocessingWatchdog:
-    """
-    Periodic liveness reporter for long-running preprocessing.
 
-    Observational only; runs in a daemon thread and prints a heartbeat
-    without mutating shared state or blocking the main thread.
-    """
 
     def __init__(self, *, interval_seconds=30, name="preprocess", out=sys.stdout):
         self.interval = float(interval_seconds)
@@ -388,7 +376,7 @@ class PreprocessingWatchdog:
         self._stop_event = threading.Event()
         self._thread = None
 
-        # Read-only published state (main thread only)
+                                                      
         self._state = {
             "batch_idx": None,
             "total_batches": None,
@@ -424,7 +412,7 @@ class PreprocessingWatchdog:
             self._state["current_item"] = current_item
 
     def _run(self):
-        # Initial delay
+                       
         if self._stop_event.wait(self.interval):
             return
         while not self._stop_event.is_set():
@@ -457,9 +445,55 @@ class PreprocessingWatchdog:
             pass
 
 
-# ============================================================
-# NoiseTransform
-# ============================================================
+def _ensure_ligand_torsion_metadata_compatible(data):
+    """
+    Make ligand.edge_mask and ligand.mask_rotate compatible with diffusion_utils.modify_conformer,
+    which indexes mask_rotate[0] for non-numpy inputs.
+    """
+    lig = data["ligand"]
+
+    mr = getattr(lig, "mask_rotate", None)
+    em = getattr(lig, "edge_mask", None)
+
+    if em is not None and not torch.is_tensor(em):
+        try:
+            em = torch.as_tensor(em)
+            lig.edge_mask = em
+        except Exception:
+            em = None
+
+    mr_mat = None
+
+    if isinstance(mr, (list, tuple)):
+        if len(mr) >= 1:
+            mr0 = mr[0]
+            if isinstance(mr0, np.ndarray):
+                mr_mat = torch.from_numpy(mr0)
+            elif torch.is_tensor(mr0):
+                mr_mat = mr0
+    elif isinstance(mr, np.ndarray):
+        mr_mat = torch.from_numpy(mr)
+    elif torch.is_tensor(mr):
+        mr_mat = mr
+
+    if torch.is_tensor(mr_mat) and mr_mat.dim() == 3 and mr_mat.shape[0] == 1:
+        mr_mat = mr_mat[0]
+
+    bad = False
+    if em is None or not torch.is_tensor(em) or em.dim() != 1:
+        bad = True
+    if mr_mat is None or (torch.is_tensor(mr_mat) and mr_mat.dim() != 2):
+        bad = True
+
+    if bad:
+        edge_mask_new, mask_rotate_new = get_transformation_mask(data)
+        lig.edge_mask = torch.as_tensor(edge_mask_new).bool()
+        mr_mat = mask_rotate_new
+        if torch.is_tensor(mr_mat) and mr_mat.dim() == 3 and mr_mat.shape[0] == 1:
+            mr_mat = mr_mat[0]
+
+    lig._mask_rotate = [mr_mat]
+
 
 class NoiseTransform(BaseTransform):
     def __init__(
@@ -513,6 +547,7 @@ class NoiseTransform(BaseTransform):
         tr_update=None, rot_update=None, torsion_updates=None
     ):
         if not torch.is_tensor(data["ligand"].pos):
+            data = copy.deepcopy(data)
             data["ligand"].pos = random.choice(data["ligand"].pos)
 
         if self.time_independent:
@@ -536,6 +571,8 @@ class NoiseTransform(BaseTransform):
         rot_update = rot_update if rot_update is not None else so3.sample_vec(eps=rot_sigma)
 
         if not self.no_torsion:
+            _ensure_ligand_torsion_metadata_compatible(data)
+
             n_edges = int(data["ligand"].edge_mask.sum())
             torsion_updates = (
                 torsion_updates if torsion_updates is not None
@@ -544,22 +581,38 @@ class NoiseTransform(BaseTransform):
         else:
             torsion_updates = None
 
+
+        # Temporarily expose mask_rotate for modify_conformer only
+        lig = data["ligand"]
+        orig_mask_rotate = getattr(lig, "mask_rotate", None)
+        lig.mask_rotate = lig._mask_rotate
+
         modify_conformer(data, tr_update, torch.from_numpy(rot_update).float(), torsion_updates)
 
+        # Clean up to keep PyG schema stable
+        if orig_mask_rotate is None:
+            delattr(lig, "mask_rotate")
+        else:
+            lig.mask_rotate = orig_mask_rotate
+
         if self.time_independent:
+            # compute orig_pos as a local numpy array only
+            orig_pos = None
             if self.no_torsion:
-                orig_complex_graph["ligand"].orig_pos = (
+                orig_pos = (
                     orig_complex_graph["ligand"].pos.cpu().numpy()
                     + orig_complex_graph.original_center.cpu().numpy()
                 )
 
             filterHs = torch.not_equal(data["ligand"].x[:, 0], 0).cpu().numpy()
-            orig_pos = orig_complex_graph["ligand"].orig_pos
-            if isinstance(orig_pos, list):
-                orig_pos = orig_pos[0]
+
+            # orig_pos must exist if you're about to use it
+            if orig_pos is None:
+                raise RuntimeError("time_independent path requires orig_pos but it was not computed")
 
             ligand_pos = data["ligand"].pos.cpu().numpy()[filterHs]
             orig_pos = orig_pos[filterHs] - orig_complex_graph.original_center.cpu().numpy()
+
             rmsd = np.sqrt(((ligand_pos - orig_pos) ** 2).sum(axis=1).mean())
 
             data.y = torch.tensor(rmsd < self.rmsd_cutoff).float().unsqueeze(0)
@@ -596,10 +649,6 @@ class NoiseTransform(BaseTransform):
         return data
 
 
-# ============================================================
-# PDBBind Dataset (preprocessing)
-# ============================================================
-
 class PDBBind(Dataset):
 
     def __init__(
@@ -634,13 +683,13 @@ class PDBBind(Dataset):
         enable_health_check=False,
         **kwargs,
     ):
-        # Ensure a usable root
+                              
         if root is None:
             root = "data/PDBBind_processed"
 
         super(PDBBind, self).__init__(root, transform)
 
-        # Public attributes used by preprocessing()
+                                                   
         self.pdbbind_dir = root
         self.split_path = split_path
         self.limit_complexes = limit_complexes
@@ -666,17 +715,16 @@ class PDBBind(Dataset):
         self.matching_tries = matching_tries
         self.dataset = dataset
         self.batch_size = int(batch_size)
-        # Allow disabling health checks for long-running or noisy runs.
-        # Can be controlled by the `enable_health_check` argument or the
-        # environment variable `PDBBIND_DISABLE_HEALTH_CHECK=1`.
+                                                                       
+                                                                        
         self.enable_health_check = bool(enable_health_check)
         if os.environ.get("PDBBIND_DISABLE_HEALTH_CHECK", "0") in ("1", "true", "True"):
             self.enable_health_check = False
 
-        # Keep behavior aligned with prior code
+                                               
         self.fixed_knn_radius_graph = True
 
-        # Cache path construction (use gold-standard builder for byte-for-byte compatibility)
+                                                                                             
         self.full_cache_path = build_gold_standard_cache_path(
             cache_path=cache_path,
             dataset=dataset,
@@ -705,14 +753,14 @@ class PDBBind(Dataset):
         )
         os.makedirs(self.full_cache_path, exist_ok=True)
 
-        # Build cache if missing, then load
+                                           
         if not self._cache_complete():
             try:
                 self.preprocessing()
             except PreprocessHealthError:
-                # Make intent explicit: re-raise to avoid accidental swallowing
+                                                                               
                 raise
-            # write metadata (compatible with older loader expectations)
+                                                                        
             names = read_strings_from_txt(self.split_path)
             if self.limit_complexes:
                 names = names[: self.limit_complexes]
@@ -728,7 +776,7 @@ class PDBBind(Dataset):
         if self.limit_complexes:
             names = names[: self.limit_complexes]
 
-        # Require fork start-method for this design
+                                                   
         if mp.get_start_method(allow_none=True) != "fork":
             raise RuntimeError("PDBBind preprocessing requires Linux fork start method.")
 
@@ -749,7 +797,7 @@ class PDBBind(Dataset):
                 return None
             pairs = list(zip(lm_indices[name], lm_embeddings_all[name]))
             pairs.sort(key=lambda x: x[0])
-            # Return NumPy arrays so Torch tensors do not cross process boundaries
+                                                                                  
             return [emb.cpu().numpy() for _, emb in pairs]
 
         monitor = PreprocessHealthMonitor(
@@ -761,13 +809,15 @@ class PDBBind(Dataset):
                 "skip_timeout": 0.05,
                 "skip_lig_graph_fail": 0.05,
                 "skip_ligand_too_large": 0.05,
+                "skip_missing_esm_embeddings": 0.90,
+                "skip_bad_esm_embedding": 0.05,
             },
             report_path=os.path.join(self.full_cache_path, "preprocess_health_report.txt"),
         )
 
         total_batches = (len(names) + self.batch_size - 1) // self.batch_size
 
-        # Write meta file at start so restarts can detect incremental progress
+                                                                              
         meta_path = os.path.join(self.full_cache_path, "heterographs.pkl")
         try:
             if not os.path.exists(meta_path):
@@ -783,21 +833,21 @@ class PDBBind(Dataset):
                 batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size
             ]
 
-            # Skip batch if cached on disk already (avoid starting watchdog thread)
+                                                                                   
             graphs_path = os.path.join(self.full_cache_path, f"heterographs{batch_idx}.pkl")
             ligs_path = os.path.join(self.full_cache_path, f"rdkit_ligands{batch_idx}.pkl")
             if os.path.exists(graphs_path) and os.path.exists(ligs_path):
-                # Cached: do not modify monitor counters (these reflect this run only)
+                                                                                      
                 continue
 
-            # Start a per-batch watchdog to emit liveness while heavy C++ calls run
+                                                                                   
             watchdog = PreprocessingWatchdog(interval_seconds=30, name="pdbbind_preprocess")
             watchdog.start()
             watchdog.update(batch_idx=batch_idx, total_batches=total_batches)
 
             try:
                 env_workers = int(os.environ.get("PDBBIND_PREPROC_WORKERS", "32"))
-                # clamp workers to a safe upper bound (half of CPU count)
+                                                                         
                 num_workers = min(env_workers, max(1, mp.cpu_count() // 2))
                 num_workers = max(1, num_workers)
 
@@ -820,6 +870,7 @@ class PDBBind(Dataset):
                     "atom_radius": self.atom_radius,
                     "atom_max_neighbors": self.atom_max_neighbors,
                     "per_complex_timeout_s": int(os.environ.get("PDBBIND_PER_COMPLEX_TIMEOUT_S", "0")) or None,
+                    "esm_embeddings_enabled": self.esm_embeddings_path is not None,
                 }
 
                 ctx = mp.get_context("fork")
@@ -848,7 +899,7 @@ class PDBBind(Dataset):
                             else:
                                 monitor.record_skip(payload)
 
-                            # keep watchdog informed of progress
+                                                                
                             try:
                                 watchdog.update(
                                     attempted=monitor.attempted,
@@ -919,7 +970,8 @@ class PDBBind(Dataset):
         if self.require_ligand:
             graph.mol = RemoveAllHs(copy.deepcopy(self.rdkit_ligands[idx]))
 
-        for a in [
+                                                            
+        DROP_KEYS = {
             "coords",
             "seq",
             "sequence",
@@ -929,10 +981,40 @@ class PDBBind(Dataset):
             "orig_seq",
             "to_keep",
             "chain_ids",
-        ]:
-            if hasattr(graph, a):
-                delattr(graph, a)
-            if "receptor" in graph and hasattr(graph["receptor"], a):
-                delattr(graph["receptor"], a)
+        }
+
+        def _scrub_store(store):
+                                                            
+            try:
+                for k in list(store.keys()):
+                    if k in DROP_KEYS:
+                        store.pop(k, None)
+            except Exception:
+                pass
+
+                                                                
+            for k in DROP_KEYS:
+                if hasattr(store, k):
+                    try:
+                        delattr(store, k)
+                    except Exception:
+                        pass
+
+                               
+        _scrub_store(graph)
+
+                           
+        for ntype in getattr(graph, "node_types", []):
+            try:
+                _scrub_store(graph[ntype])
+            except Exception:
+                pass
+
+                                       
+        for etype in getattr(graph, "edge_types", []):
+            try:
+                _scrub_store(graph[etype])
+            except Exception:
+                pass
 
         return graph
