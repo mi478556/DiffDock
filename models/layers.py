@@ -26,7 +26,9 @@ class GaussianSmearing(torch.nn.Module):
         self.register_buffer('offset', offset)
 
     def forward(self, dist):
-        dist = dist.view(-1, 1) - self.offset.view(1, -1)
+        # Ensure the registered buffer lives on the same device as the input
+        offset = self.offset.to(dist.device)
+        dist = dist.view(-1, 1) - offset.view(1, -1)
         return torch.exp(self.coeff * torch.pow(dist, 2))
 
 

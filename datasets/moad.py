@@ -1,21 +1,360 @@
 import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+                                                                              
 import pickle
-from multiprocessing import Pool
+import multiprocessing as mp
+import time
+import queue
+import threading
+try:
+    mp.set_start_method("fork")
+except RuntimeError:
+    pass
 import random
 import copy
 from torch_geometric.data import Batch
+import itertools
 
 import numpy as np
 import torch
+import json
 from prody import confProDy
 from rdkit import Chem
 from rdkit.Chem import RemoveHs
+from rdkit.Chem.rdchem import Mol as RDMol
+from functools import partial
 from torch_geometric.data import Dataset, HeteroData
 from torch_geometric.utils import subgraph
 from tqdm import tqdm
+import sys
 confProDy(verbosity='none')
 from datasets.process_mols import get_lig_graph_with_matching, moad_extract_receptor_structure
 from utils.utils import read_strings_from_txt
+
+
+DEBUG_MAX_RECEPTOR_BATCHES = int(os.environ.get("MOAD_DEBUG_MAX_RECEPTOR_BATCHES", "0"))
+DEBUG_MAX_LIGAND_BATCHES = int(os.environ.get("MOAD_DEBUG_MAX_LIGAND_BATCHES", "0"))
+
+
+def _debug_batch_limit_reached(i, limit):
+    return limit > 0 and i >= limit
+
+                              
+_RECEPTOR_CFG = None
+_RECEPTOR_MOAD_DIR = None
+
+
+def _scrub_graph_schema(g: HeteroData):
+
+
+    DROP_KEYS = {
+                                         
+        "random_coords",
+        "rmsd_matching",
+
+                          
+        "seq",
+        "sequence",
+        "orig_seq",
+        "orig_sequence",
+
+                         
+        "mask",
+        "to_keep",
+
+                                  
+        "cluster",
+
+                           
+        "coords",
+    }
+
+                      
+    def _scrub_store(store):
+                            
+        for k in list(store.keys()):
+            if k in DROP_KEYS:
+                try:
+                    store.pop(k)
+                except Exception:
+                    pass
+
+                                
+        for k in DROP_KEYS:
+            if hasattr(store, k):
+                try:
+                    delattr(store, k)
+                except Exception:
+                    pass
+
+                               
+    try:
+        _scrub_store(g)
+    except Exception:
+        pass
+
+                           
+    try:
+        for ntype in getattr(g, "node_types", []):
+            try:
+                _scrub_store(g[ntype])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+                           
+    try:
+        for etype in getattr(g, "edge_types", []):
+            try:
+                _scrub_store(g[etype])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return g
+
+
+def _normalize_numeric_to_tensors(g: HeteroData) -> HeteroData:
+
+
+    def _to_tensor(v):
+                          
+        if torch.is_tensor(v):
+            return v
+                                     
+        if isinstance(v, np.ndarray):
+            try:
+                return torch.from_numpy(v)
+            except Exception:
+                return v
+                                       
+        if isinstance(v, (list, tuple)) and len(v) > 0:
+                                                                     
+                                                                                                      
+            if isinstance(v[0], np.ndarray):
+                try:
+                    return [torch.from_numpy(x) for x in v]
+                except Exception:
+                    return v
+                             
+            if isinstance(v[0], (int, float, np.integer, np.floating)):
+                try:
+                    return torch.tensor(v)
+                except Exception:
+                    return v
+        return v
+
+                                                 
+    stores = [g]
+    try:
+        stores += [g[n] for n in getattr(g, "node_types", [])]
+    except Exception:
+        pass
+    try:
+        stores += [g[e] for e in getattr(g, "edge_types", [])]
+    except Exception:
+        pass
+
+    for store in stores:
+        try:
+            for k in list(store.keys()):
+                store[k] = _to_tensor(store[k])
+        except Exception:
+            pass
+
+    return g
+
+
+def _strip_non_tensor_fields_keep_required(g: HeteroData) -> HeteroData:
+
+
+    SAFE_NON_TENSOR = {
+        "name",
+        "receptor_name",
+    }
+
+                                                                                   
+    SAFE_LIST_OF_TENSORS = {
+        "pos",
+        "orig_pos",
+    }
+
+    stores = [g]
+    try:
+        stores += [g[n] for n in getattr(g, "node_types", [])]
+    except Exception:
+        pass
+    try:
+        stores += [g[e] for e in getattr(g, "edge_types", [])]
+    except Exception:
+        pass
+
+    for store in stores:
+        try:
+            for k in list(store.keys()):
+                if k in SAFE_NON_TENSOR:
+                    continue
+                v = store.get(k, None)
+
+                                                                          
+                try:
+                    if isinstance(v, RDMol):
+                        store.pop(k, None)
+                        continue
+                except Exception:
+                    pass
+
+                                                          
+                if torch.is_tensor(v):
+                    continue
+
+                if k in SAFE_LIST_OF_TENSORS and isinstance(v, list) and len(v) > 0 and torch.is_tensor(v[0]):
+                    continue
+
+                store.pop(k, None)
+        except Exception:
+            pass
+
+    return g
+
+
+class _AlarmTimeout(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise _AlarmTimeout()
+
+
+def _receptor_worker_init():
+                                                                                      
+                                                                                   
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+                             
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+    try:
+        import torch
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+
+def _build_receptor_from_name(args):
+
+    import pickle
+    import torch
+    import signal
+
+                                                
+    try:
+        name, cfg, moad_dir, emb = args
+    except Exception:
+        return ("skip", "bad_args")
+
+    rec_path = os.path.join(moad_dir, "pdb_protein", name + "_protein.pdb")
+    if not os.path.exists(rec_path):
+        return ("skip", "missing_file")
+
+                                                               
+    timeout_s = int(cfg.get("per_receptor_timeout_s", 0) or 0)
+    if os.name == "posix" and timeout_s > 0:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(timeout_s)
+
+    try:
+        from torch_geometric.data import HeteroData
+        from datasets.process_mols import moad_extract_receptor_structure
+
+        cg = HeteroData()
+        cg["receptor_name"] = name
+        try:
+            cg.receptor_name = name
+        except Exception:
+            pass
+
+        try:
+                                                                               
+                                                                                  
+            lm_embeddings = None
+            if emb is not None:
+                rec_emb_path = os.path.join(emb, f"{name}.pt")
+                if os.path.exists(rec_emb_path):
+                    try:
+                        lm_embeddings = torch.load(rec_emb_path, map_location="cpu")
+                    except Exception:
+                        return ("skip", "lm_load_fail")
+                else:
+                    return ("skip", "missing_lm_embeddings")
+
+            moad_extract_receptor_structure(
+                path=rec_path,
+                complex_graph=cg,
+                neighbor_cutoff=cfg["receptor_radius"],
+                max_neighbors=cfg["c_alpha_max_neighbors"],
+                lm_embeddings=lm_embeddings,
+                knn_only_graph=cfg["knn_only_graph"],
+                all_atoms=cfg["all_atoms"],
+                atom_cutoff=cfg["atom_radius"],
+                atom_max_neighbors=cfg["atom_max_neighbors"],
+            )
+        except Exception:
+            return ("skip", "receptor_extract_fail")
+
+                                                              
+        if emb is not None:
+            if "receptor" not in cg.node_types:
+                return ("skip", "no_receptor")
+
+                                                             
+            x = getattr(cg["receptor"], "x", None)
+            if x is None:
+                return ("skip", "missing_embeddings")
+
+            try:
+                if x.shape[0] != cg["receptor"].pos.shape[0]:
+                    return ("skip", "embedding_misalignment")
+                esm_dim = cfg.get("esm_dim", None)
+                if esm_dim is not None:
+                    if x.shape[1] < esm_dim:
+                        return ("skip", "missing_esm_channels")
+            except Exception:
+                return ("skip", "missing_embeddings")
+
+        try:
+            if "receptor" not in cg.node_types:
+                return ("skip", "no_receptor")
+            rec = cg["receptor"]
+            center = torch.mean(rec.pos, dim=0, keepdim=True)
+            rec.pos -= center
+            if cfg.get("all_atoms") and ("atom" in cg.node_types):
+                cg["atom"].pos -= center
+            cg.original_center = center
+        except Exception:
+            return ("skip", "centering_fail")
+
+                                                                                             
+        if not hasattr(cg, "original_center"):
+            return ("skip", "missing_original_center")
+
+        cg = _scrub_graph_schema(cg)
+        return ("ok", pickle.dumps(cg, protocol=pickle.HIGHEST_PROTOCOL))
+
+    except _AlarmTimeout:
+        return ("skip", "timeout")
+
+    except Exception:
+        return ("skip", "worker_crash")
+
+    finally:
+        if os.name == "posix" and timeout_s > 0:
+            signal.alarm(0)
 
 class MOAD(Dataset):
     def __init__(self, root, transform=None, cache_path='data/cache', split='train', limit_complexes=0, chain_cutoff=None,
@@ -65,6 +404,12 @@ class MOAD(Dataset):
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
                                             + ('' if self.matching_tries == 1 else f'_tries{matching_tries}'))
 
+        if DEBUG_MAX_RECEPTOR_BATCHES > 0 or DEBUG_MAX_LIGAND_BATCHES > 0:
+            print(
+                f"[DEBUG MODE] receptor_batches={DEBUG_MAX_RECEPTOR_BATCHES}, "
+                f"ligand_batches={DEBUG_MAX_LIGAND_BATCHES}"
+            )
+
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers
@@ -78,7 +423,7 @@ class MOAD(Dataset):
         clustes_path = os.path.join(self.moad_dir, "new_cluster_to_ligands.pkl")
         with open(clustes_path, "rb") as f:
             self.cluster_to_ligands = pickle.load(f)
-            #self.cluster_to_ligands = {k: [s.split('.')[0] for s in v] for k, v in self.cluster_to_ligands.items()}
+                                                                                                                    
 
         self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
         if not self.check_all_receptors():
@@ -92,28 +437,35 @@ class MOAD(Dataset):
 
         print('loading ligands from memory: ', os.path.join(self.lig_cache_path, "ligands.pkl"))
         with open(os.path.join(self.lig_cache_path, "ligands.pkl"), 'rb') as f:
-            self.ligands = pickle.load(f)
+            ligs = pickle.load(f)
 
-        if require_ligand:
-            with open(os.path.join(self.lig_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
-                self.rdkit_ligands = pickle.load(f)
-                self.rdkit_ligands = {lig.name:mol for mol, lig in zip(self.rdkit_ligands, self.ligands)}
+        if isinstance(ligs, list):
+            self.ligands = {g.name: g for g in ligs}
+        else:
+            self.ligands = ligs
 
-        len_before = len(self.ligands)
-        if not self.single_cluster_name is None:
-            self.ligands = [lig for lig in self.ligands if lig.name in self.cluster_to_ligands[self.single_cluster_name]]
-        print('Kept', len(self.ligands), f'ligands in {self.single_cluster_name} out of', len_before)
+                                                   
+        if self.require_ligand:
+            rdkit_path = os.path.join(self.lig_cache_path, "rdkit_ligands.pkl")
+            if os.path.exists(rdkit_path):
+                with open(rdkit_path, 'rb') as rf:
+                    mols = pickle.load(rf)
+                try:
+                    self.rdkit_ligands = {lig.name: mol for lig, mol in zip(self.ligands.values(), mols)}
+                except Exception:
+                                                         
+                    self.rdkit_ligands = {}
 
-        len_before = len(self.ligands)
-        self.ligands = {lig.name: lig for lig in self.ligands if min_ligand_size == 0 or lig['ligand'].x.shape[0] >= min_ligand_size}
-        print('removed', len_before - len(self.ligands), 'ligands below minimum size out of', len_before)
+                                                                                             
+        receptors_names = set([k[:6] for k in self.ligands.keys()])
+        self.collect_receptors(
+            receptors_to_keep=receptors_names,
+            max_receptor_size=max_receptor_size,
+            remove_promiscuous_targets=remove_promiscuous_targets,
+        )
 
-        receptors_names = set([lig.name[:6] for lig in self.ligands.values()])
-        self.collect_receptors(receptors_names, max_receptor_size, remove_promiscuous_targets)
-
-        # filter ligands for which the receptor failed
         tot_before = len(self.ligands)
-        self.ligands = {k:v for k, v in self.ligands.items() if k[:6] in self.receptors}
+        self.ligands = {k: v for k, v in self.ligands.items() if k[:6] in self.receptors}
         print('removed', tot_before - len(self.ligands), 'ligands with no receptor out of', tot_before)
 
         if remove_pdbbind:
@@ -152,7 +504,8 @@ class MOAD(Dataset):
                  self.cluster_to_ligands[c] = [v for v in self.cluster_to_ligands[c] if v in self.ligands]
             self.split_clusters = [c for c in self.split_clusters if len(self.cluster_to_ligands[c])>0]
 
-        print_statistics(self)
+        if os.environ.get("MOAD_DEBUG_STATS", "") == "1":
+            print_statistics(self)
         list_names = [name for cluster in self.split_clusters for name in self.cluster_to_ligands[cluster]]
         with open(os.path.join(self.prot_cache_path, f'moad_{self.split}_names.txt'), 'w') as f:
             f.write('\n'.join(list_names))
@@ -161,6 +514,8 @@ class MOAD(Dataset):
         return len(self.split_clusters) * self.multiplicity if self.total_dataset_size is None else self.total_dataset_size
 
     def get_by_name(self, ligand_name, cluster):
+        assert ligand_name in self.ligands
+        assert ligand_name[:6] in self.receptors
         ligand_graph = copy.deepcopy(self.ligands[ligand_name])
         complex_graph = copy.deepcopy(self.receptors[ligand_name[:6]])
 
@@ -169,7 +524,7 @@ class MOAD(Dataset):
             lig = Chem.MolFromPDBFile(lig_path)
             formula = np.asarray([atom.GetSymbol() for atom in lig.GetAtoms()])
 
-            # check for same receptor/ligand pair with a different binding position
+                                                                                   
             for ligand_comp in self.cluster_to_ligands[cluster]:
                 if ligand_comp == ligand_name or ligand_comp[:6] != ligand_name[:6]:
                     continue
@@ -184,7 +539,7 @@ class MOAD(Dataset):
                 if formula.shape == formula_comp.shape and np.all(formula == formula_comp) and hasattr(
                         self.ligands[ligand_comp], 'orig_pos'):
                     print(f'Found complex {ligand_comp} to have the same complex/ligand pair, adding it into orig_pos')
-                    # add the orig_pos of the binding position
+                                                              
                     if not isinstance(ligand_graph['ligand'].orig_pos, list):
                         ligand_graph['ligand'].orig_pos = [ligand_graph['ligand'].orig_pos]
                     ligand_graph['ligand'].orig_pos.append(self.ligands[ligand_comp].orig_pos)
@@ -198,17 +553,23 @@ class MOAD(Dataset):
                 complex_graph['ligand'].pos[i] -= complex_graph.original_center
         else:
             complex_graph['ligand'].pos -= complex_graph.original_center
-        if self.require_ligand:
+                                                                           
+                                                                                                 
+        if False and self.require_ligand and self.split != "val":
             complex_graph.mol = copy.deepcopy(self.rdkit_ligands[ligand_name])
 
         if self.chain_cutoff:
-            distances = torch.norm(
-                (torch.from_numpy(complex_graph['ligand'].orig_pos[0]) - complex_graph.original_center).unsqueeze(1) - complex_graph['receptor'].pos.unsqueeze(0), dim=2)
-            distances = distances.min(dim=0)[0]
+            try:
+                distances = torch.norm(
+                    (torch.from_numpy(complex_graph['ligand'].orig_pos[0]) - complex_graph.original_center)
+                    .unsqueeze(1) - complex_graph['receptor'].pos.unsqueeze(0),
+                    dim=2
+                )
+                distances = distances.min(dim=0)[0]
+            except Exception:
+                return self.get(random.randint(0, self.len()))
+
             if torch.min(distances) >= self.chain_cutoff:
-                print('minimum distance', torch.min(distances), 'too large', ligand_name,
-                      'skipping and returning random. Number of chains',
-                      torch.max(complex_graph['receptor'].chain_ids) + 1)
                 return self.get(random.randint(0, self.len()))
 
             within_cutoff = distances < self.chain_cutoff
@@ -226,7 +587,7 @@ class MOAD(Dataset):
 
                 complex_graph['atom'].x = complex_graph['atom'].x[atoms_to_keep]
                 complex_graph['atom'].pos = complex_graph['atom'].pos[atoms_to_keep]
-                complex_graph['atom', 'atom_contact', 'atom'].edge_index = \
+                complex_graph['atom', 'atom_contact', 'atom'].edge_index =\
                     subgraph(atoms_to_keep, complex_graph['atom', 'atom_contact', 'atom'].edge_index,
                              relabel_nodes=True)[0]
                 complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
@@ -234,48 +595,66 @@ class MOAD(Dataset):
             complex_graph['receptor'].pos = complex_graph['receptor'].pos[residues_to_keep]
             complex_graph['receptor'].x = complex_graph['receptor'].x[residues_to_keep]
             complex_graph['receptor'].side_chain_vecs = complex_graph['receptor'].side_chain_vecs[residues_to_keep]
-            complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = \
-            subgraph(residues_to_keep, complex_graph['receptor', 'rec_contact', 'receptor'].edge_index,
-                     relabel_nodes=True)[0]
+            complex_graph['receptor', 'rec_contact', 'receptor'].edge_index =\
+                subgraph(residues_to_keep, complex_graph['receptor', 'rec_contact', 'receptor'].edge_index,
+                         relabel_nodes=True)[0]
 
-            extra_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
-            complex_graph['receptor'].pos -= extra_center
-            if isinstance(complex_graph['ligand'].pos, list):
-                for i in range(len(complex_graph['ligand'].pos)):
-                    complex_graph['ligand'].pos[i] -= extra_center
-            else:
-                complex_graph['ligand'].pos -= extra_center
-            complex_graph.original_center += extra_center
+                                                                                       
+            try:
+                extra_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
+                complex_graph['receptor'].pos -= extra_center
+                if isinstance(complex_graph['ligand'].pos, list):
+                    for j in range(len(complex_graph['ligand'].pos)):
+                        complex_graph['ligand'].pos[j] -= extra_center
+                else:
+                    complex_graph['ligand'].pos -= extra_center
+                                                                              
+                complex_graph.original_center += extra_center
+            except Exception:
+                pass
 
-        complex_graph['receptor'].pop('chain_ids')
+        try:
+            if 'chain_ids' in complex_graph['receptor']:
+                complex_graph['receptor'].pop('chain_ids')
+        except Exception:
+            pass
 
-        for a in ['random_coords', 'coords', 'seq', 'sequence', 'mask', 'rmsd_matching', 'cluster', 'orig_seq',
-                  'to_keep', 'chain_ids']:
-            if hasattr(complex_graph, a):
-                delattr(complex_graph, a)
-            if hasattr(complex_graph['receptor'], a):
-                delattr(complex_graph['receptor'], a)
-
+        complex_graph = _scrub_graph_schema(complex_graph)
         return complex_graph
 
     def get(self, idx):
-        if self.total_dataset_size is not None:
-            idx = random.randint(0, len(self.split_clusters) - 1)
+        assert hasattr(self, "receptors"), "Receptors not loaded"
+        assert hasattr(self, "ligands"), "Ligands not loaded"
 
-        idx = idx % len(self.split_clusters)
-        cluster = self.split_clusters[idx]
+        max_tries = 50
 
-        if self.no_randomness:
-            ligand_name = sorted(self.cluster_to_ligands[cluster])[0]
-        else:
-            ligand_name = random.choice(self.cluster_to_ligands[cluster])
+        for _ in range(max_tries):
+                                                                             
+                                                                                            
+            if self.total_dataset_size is not None:
+                idx = random.randint(0, len(self.split_clusters) - 1)
 
-        complex_graph = self.get_by_name(ligand_name, cluster)
-        
-        if self.total_dataset_size is not None:
-            complex_graph = Batch.from_data_list([complex_graph])
-            
-        return complex_graph
+            idx = idx % len(self.split_clusters)
+            cluster = self.split_clusters[idx]
+
+            if self.no_randomness:
+                ligand_name = sorted(self.cluster_to_ligands[cluster])[0]
+            else:
+                ligand_name = random.choice(self.cluster_to_ligands[cluster])
+
+            g = self.get_by_name(ligand_name, cluster)
+
+                                                                                                   
+            if self.esm_embeddings_path is not None:
+                if not self._has_valid_receptor_embeddings(g):
+                              
+                    idx = random.randint(0, self.len())
+                    continue
+
+                                                                                                              
+            return g
+
+        raise RuntimeError("MOAD.get failed to sample a valid graph with embeddings enabled")
 
     def get_all_complexes(self):
         complexes = {}
@@ -284,8 +663,42 @@ class MOAD(Dataset):
                 complexes[ligand_name] = self.get_by_name(ligand_name, cluster)
         return complexes
 
+    def _has_valid_receptor_embeddings(self, g: HeteroData) -> bool:
+                                                
+        if self.esm_embeddings_path is None:
+            return True
+
+                                       
+        if "receptor" not in getattr(g, "node_types", []):
+            return False
+
+        rec = g["receptor"]
+
+                             
+        x = getattr(rec, "x", None)
+        pos = getattr(rec, "pos", None)
+        if x is None or pos is None:
+            return False
+
+                                              
+        try:
+            if x.dim() != 2:
+                return False
+            if x.shape[0] != pos.shape[0]:
+                return False
+        except Exception:
+            return False
+
+                                            
+        if getattr(self, "expected_esm_dim", None) is not None:
+            if x.shape[1] != int(self.expected_esm_dim):
+                return False
+
+        return True
+
     def preprocessing_receptors(self):
         print(f'Processing receptors from [{self.split}] and saving it to [{self.prot_cache_path}]')
+        self._preprocessing_running = True
 
         complex_names_all = sorted([l for c in self.split_clusters for l in self.cluster_to_ligands[c]])
         if self.limit_complexes is not None and self.limit_complexes != 0:
@@ -295,61 +708,180 @@ class MOAD(Dataset):
         receptor_names_all = sorted(list(dict.fromkeys(receptor_names_all)))
         print(f'Loading {len(receptor_names_all)} receptors.')
 
-        if self.esm_embeddings_path is not None:
-            id_to_embeddings = torch.load(self.esm_embeddings_path)
-            sequences_list = read_strings_from_txt(self.esm_embeddings_sequences_path)
-            sequences_to_embeddings = {}
-            for i, seq in enumerate(sequences_list):
-                # support embeddings saved with string keys ('0','1',...) or integer keys (0,1,...)
-                key_str = str(i)
-                emb = None
-                # try canonical lookup by sequence (preferred)
-                if seq in id_to_embeddings:
-                    emb = id_to_embeddings[seq]
-                elif seq.encode('utf-8') in id_to_embeddings:
-                    emb = id_to_embeddings[seq.encode('utf-8')]
-                # fallback to numeric/indexed keys
-                elif key_str in id_to_embeddings:
-                    emb = id_to_embeddings[key_str]
-                elif i in id_to_embeddings:
-                    emb = id_to_embeddings[i]
-                else:
-                    # sometimes keys may be bytes of the numeric string
-                    try:
-                        kb = key_str.encode('utf-8')
-                        if kb in id_to_embeddings:
-                            emb = id_to_embeddings[kb]
-                    except Exception:
-                        pass
-                if emb is not None:
-                    sequences_to_embeddings[seq] = emb
-
+                                                                                   
+        lm_embeddings_dir = self.esm_embeddings_path
+        if lm_embeddings_dir is not None:
+            assert os.path.isdir(lm_embeddings_dir), f"Expected directory, got {lm_embeddings_dir}"
+                                                                                  
+            emb_dim = None
+            try:
+                for fn in os.listdir(lm_embeddings_dir):
+                    if fn.endswith('.meta.json'):
+                        with open(os.path.join(lm_embeddings_dir, fn), 'r') as mf:
+                            meta = json.load(mf)
+                        if meta.get('esm_dim') is not None:
+                            emb_dim = int(meta.get('esm_dim'))
+                            break
+            except Exception:
+                emb_dim = None
         else:
-            sequences_to_embeddings = None
+            lm_embeddings_dir = None
+            emb_dim = None
+                                                  
+        self.esm_dim = emb_dim
+                                                                    
+        self.expected_esm_dim = int(emb_dim) if emb_dim is not None else None
 
-        # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
-        list_indices = list(range(len(receptor_names_all)//1000+1))
-        random.shuffle(list_indices)
+                                                                                                            
+        n_batches = (len(receptor_names_all) + 999) // 1000
+        list_indices = list(range(n_batches))
+        if DEBUG_MAX_RECEPTOR_BATCHES <= 0:
+            random.shuffle(list_indices)
+        else:
+            list_indices = list_indices[:DEBUG_MAX_RECEPTOR_BATCHES]
         for i in list_indices:
-            if os.path.exists(os.path.join(self.prot_cache_path, f"receptors{i}.pkl")):
+            batch_path = os.path.join(self.prot_cache_path, f"receptors_batch_{i}.pkl")
+            if os.path.exists(batch_path):
                 continue
             receptor_names = receptor_names_all[1000*i:1000*(i+1)]
             receptor_graphs = []
-            if self.num_workers > 1:
-                p = Pool(self.num_workers, maxtasksperchild=1)
-                p.__enter__()
-            with tqdm(total=len(receptor_names), desc=f'loading receptors {i}/{len(receptor_names_all)//1000+1}') as pbar:
-                map_fn = p.imap_unordered if self.num_workers > 1 else map
-                for t in map_fn(self.get_receptor, zip(receptor_names, [sequences_to_embeddings]*len(receptor_names))):
-                    if t is not None:
-                        print(len(receptor_graphs))
-                        receptor_graphs.append(t)
-                    pbar.update()
-            if self.num_workers > 1: p.__exit__(None, None, None)
+            attempted = 0
+            skipped = 0
+            skipped_by_reason = {}
 
-            print('Number of receptors: ', len(receptor_graphs))
-            with open(os.path.join(self.prot_cache_path, f"receptors{i}.pkl"), 'wb') as f:
-                pickle.dump((receptor_graphs), f)
+            stop_event = threading.Event()
+            t = None
+
+            def _watchdog(stop_event):
+                while not stop_event.is_set():
+                    tqdm.write(f"[watchdog] batch {i}, processed {len(receptor_graphs)}")
+                    stop_event.wait(30)
+
+            try:
+                                                                                                   
+                cfg = {
+                    "receptor_radius": self.receptor_radius,
+                    "c_alpha_max_neighbors": self.c_alpha_max_neighbors,
+                    "knn_only_graph": self.knn_only_graph,
+                    "all_atoms": self.all_atoms,
+                    "atom_radius": self.atom_radius,
+                    "atom_max_neighbors": self.atom_max_neighbors,
+                                                             
+                    "per_receptor_timeout_s": int(os.environ.get("MOAD_PER_RECEPTOR_TIMEOUT_S", "0") or 0),
+                                                                            
+                    "esm_dim": (int(emb_dim) if emb_dim is not None else None),
+                }
+
+                num_workers_pool = int(os.environ.get("MOAD_RECEPTOR_WORKERS", "28"))
+                num_workers_pool = max(1, min(num_workers_pool, max(1, mp.cpu_count() - 2)))
+
+                                                                          
+                prev_threads = None
+                prev_interop = None
+                try:
+                    prev_threads = torch.get_num_threads()
+                    prev_interop = torch.get_num_interop_threads()
+                except Exception:
+                    pass
+                try:
+                    torch.set_num_threads(1)
+                    torch.set_num_interop_threads(1)
+                except Exception:
+                    pass
+
+                attempted = 0
+                ok_count = 0
+                skipped = 0
+                skipped_by_reason = {}
+                receptor_graphs = []
+
+                                                           
+                method = mp.get_start_method(allow_none=True)
+                if method is not None and method != "fork":
+                    raise RuntimeError(
+                        f"Multiprocessing start method is '{method}'. This code expects 'fork' for worker behavior. "
+                        "Set multiprocessing start method to 'fork' before creating the dataset (mp.set_start_method('fork')) "
+                        "or run with num_workers=0 to disable multiprocessing."
+                    )
+
+                assert lm_embeddings_dir is None or isinstance(lm_embeddings_dir, str)
+
+                ctx = mp.get_context("fork")
+                with ctx.Pool(
+                    processes=num_workers_pool,
+                    initializer=_receptor_worker_init,
+                    maxtasksperchild=1,
+                ) as pool:
+                                                                             
+                    t = threading.Thread(target=_watchdog, args=(stop_event,))
+                    t.daemon = True
+                    t.start()
+                                                                                                
+                    task_args = [(name, cfg, self.moad_dir, lm_embeddings_dir) for name in receptor_names]
+                    it = pool.imap_unordered(_build_receptor_from_name, task_args, chunksize=1)
+                    with tqdm(
+                        total=len(receptor_names),
+                        desc=f'building receptors {i}/{len(receptor_names_all)//1000+1}',
+                        file=sys.stdout,
+                        dynamic_ncols=True,
+                        leave=True,
+                    ) as pbar2:
+                        for status, payload in it:
+                            attempted += 1
+                            if status == "ok":
+                                try:
+                                    g = pickle.loads(payload)
+                                    receptor_graphs.append(g)
+                                    ok_count += 1
+                                except Exception:
+                                    skipped += 1
+                                    skipped_by_reason["parent_unpickle_fail"] = skipped_by_reason.get("parent_unpickle_fail", 0) + 1
+                            else:
+                                skipped += 1
+                                skipped_by_reason[payload] = skipped_by_reason.get(payload, 0) + 1
+                            pbar2.update(1)
+
+                                                
+                try:
+                    if prev_threads is not None:
+                        torch.set_num_threads(int(prev_threads))
+                    if prev_interop is not None:
+                        torch.set_num_interop_threads(int(prev_interop))
+                except Exception:
+                    pass
+
+                print('Number of receptors: ', len(receptor_graphs))
+
+                with open(batch_path, 'wb') as f:
+                    pickle.dump(receptor_graphs, f)
+
+                stats = {
+                    'attempted': attempted,
+                    'ok': ok_count,
+                    'skipped': skipped,
+                    'skipped_by_reason': skipped_by_reason,
+                    'num_workers': num_workers_pool,
+                }
+                with open(os.path.join(self.prot_cache_path, f"receptors_batch_{i}_stats.pkl"), 'wb') as sf:
+                    pickle.dump(stats, sf)
+                                                                     
+
+                del receptor_graphs
+                import gc
+                gc.collect()
+            finally:
+                                                        
+                try:
+                    stop_event.set()
+                    if t is not None:
+                        t.join(timeout=5)
+                except Exception:
+                    pass
+
+                print('Attempted:', attempted)
+                print('Skipped:', skipped)
+                print('Skip reasons:', skipped_by_reason)
+        del self._preprocessing_running
         return receptor_names_all
 
     def check_all_receptors(self):
@@ -358,8 +890,12 @@ class MOAD(Dataset):
             complex_names_all = complex_names_all[:self.limit_complexes]
         receptor_names_all = [l[:6] for l in complex_names_all]
         receptor_names_all = list(dict.fromkeys(receptor_names_all))
-        for i in range(len(receptor_names_all)//1000+1):
-            if not os.path.exists(os.path.join(self.prot_cache_path, f"receptors{i}.pkl")):
+        n_batches = (len(receptor_names_all) + 999) // 1000
+        if DEBUG_MAX_RECEPTOR_BATCHES > 0:
+            n_batches = min(n_batches, DEBUG_MAX_RECEPTOR_BATCHES)
+
+        for i in range(n_batches):
+            if not os.path.exists(os.path.join(self.prot_cache_path, f"receptors_batch_{i}.pkl")):
                 return False
         return True
 
@@ -372,14 +908,40 @@ class MOAD(Dataset):
 
         receptor_graphs_all = []
         total_recovered = 0
-        print(f'Loading {len(receptor_names_all)} receptors to keep {len(receptors_to_keep)}.')
+        n_keep = len(receptors_to_keep) if receptors_to_keep is not None else "ALL"
+        print(f'Loading {len(receptor_names_all)} receptors to keep {n_keep}.')
         for i in range(len(receptor_names_all)//1000+1):
-            print(f'prot path: {os.path.join(self.prot_cache_path, f"receptors{i}.pkl")}')
-            with open(os.path.join(self.prot_cache_path, f"receptors{i}.pkl"), 'rb') as f:
+            batch_path = os.path.join(self.prot_cache_path, f"receptors_batch_{i}.pkl")
+            print(f'prot path: {batch_path}')
+            if not os.path.exists(batch_path):
+                print(f'Missing receptor batch {batch_path}, skipping')
+                continue
+            with open(batch_path, 'rb') as f:
                 l = pickle.load(f)
                 total_recovered += len(l)
+
                 if receptors_to_keep is not None:
-                    l = [t for t in l if t['receptor_name'] in receptors_to_keep]
+                    l = [t for t in l if t.get("receptor_name", None) in receptors_to_keep]
+
+                                                                      
+                if self.esm_embeddings_path is not None and getattr(self, "expected_esm_dim", None) is None:
+                    for t in l:
+                        try:
+                            if "receptor" in getattr(t, "node_types", []):
+                                x = getattr(t["receptor"], "x", None)
+                                if x is not None and hasattr(x, "shape") and len(x.shape) == 2:
+                                    self.expected_esm_dim = int(x.shape[1])
+                                    break
+                        except Exception:
+                            continue
+
+                                                                                
+                if self.esm_embeddings_path is not None:
+                    before = len(l)
+                    l = [t for t in l if self._has_valid_receptor_embeddings(t)]
+                    if before != len(l):
+                        print(f"Filtered {before - len(l)} receptors in batch {i} due to invalid/missing embeddings")
+
                 receptor_graphs_all.extend(l)
 
         cur_len = len(receptor_graphs_all)
@@ -396,113 +958,163 @@ class MOAD(Dataset):
                 l = name.split('_')
                 if int(l[3]) > remove_promiscuous_targets:
                     promiscuous_targets.add(name[:6])
-            receptor_graphs_all = [rec for rec in receptor_graphs_all if rec["receptor_name"] not in promiscuous_targets]
+            receptor_graphs_all = [rec for rec in receptor_graphs_all if rec.get("receptor_name", None) not in promiscuous_targets]
             print(f"Kept {len(receptor_graphs_all)} receptors out of {cur_len} after removing promiscuous targets")
 
         self.receptors = {}
         for r in receptor_graphs_all:
-            self.receptors[r['receptor_name']] = r
+            k = r.get("receptor_name", None)
+            if k is None:
+                continue
+            self.receptors[k] = r
         return
 
-    def get_receptor(self, par):
-        name, sequences_to_embeddings = par
-        rec_path = os.path.join(self.moad_dir, 'pdb_protein', name + '_protein.pdb')
-        if not os.path.exists(rec_path):
-            print("Receptor not found", name, rec_path)
-            return None
-
-        complex_graph = HeteroData()
-        complex_graph['receptor_name'] = name
-        try:
-            moad_extract_receptor_structure(path=rec_path, complex_graph=complex_graph, neighbor_cutoff=self.receptor_radius,
-                                            max_neighbors=self.c_alpha_max_neighbors, sequences_to_embeddings=sequences_to_embeddings,
-                                            knn_only_graph=self.knn_only_graph, all_atoms=self.all_atoms, atom_cutoff=self.atom_radius,
-                                            atom_max_neighbors=self.atom_max_neighbors)
-
-        except Exception as e:
-            print(f'Skipping {name} because of the error:')
-            print(e)
-            return None
-
-        protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
-        complex_graph['receptor'].pos -= protein_center
-        if self.all_atoms:
-            complex_graph['atom'].pos -= protein_center
-        complex_graph.original_center = protein_center
-        return complex_graph
-
-
+                                                                                                    
     def preprocessing_ligands(self):
         print(f'Processing complexes from [{self.split}] and saving it to [{self.lig_cache_path}]')
+        self._preprocessing_running = True
 
         complex_names_all = sorted([l for c in self.split_clusters for l in self.cluster_to_ligands[c]])
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} ligands.')
 
-        # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
-        list_indices = list(range(len(complex_names_all)//1000+1))
-        random.shuffle(list_indices)
+                                                                                                            
+        n_batches = (len(complex_names_all) + 999) // 1000
+        list_indices = list(range(n_batches))
+        if DEBUG_MAX_LIGAND_BATCHES <= 0:
+            random.shuffle(list_indices)
+        else:
+            list_indices = list_indices[:DEBUG_MAX_LIGAND_BATCHES]
         for i in list_indices:
-            if os.path.exists(os.path.join(self.lig_cache_path, f"ligands{i}.pkl")):
+            batch_lig_path = os.path.join(self.lig_cache_path, f"ligands_batch_{i}.pkl")
+            batch_rdkit_path = os.path.join(self.lig_cache_path, f"rdkit_ligands_batch_{i}.pkl")
+            if os.path.exists(batch_lig_path) and os.path.exists(batch_rdkit_path):
                 continue
             complex_names = complex_names_all[1000*i:1000*(i+1)]
             ligand_graphs, rdkit_ligands = [], []
-            if self.num_workers > 1:
-                p = Pool(self.num_workers, maxtasksperchild=1)
-                p.__enter__()
-            with tqdm(total=len(complex_names), desc=f'loading complexes {i}/{len(complex_names_all)//1000+1}') as pbar:
-                map_fn = p.imap_unordered if self.num_workers > 1 else map
-                for t in map_fn(self.get_ligand, complex_names):
-                    if t is not None:
-                        ligand_graphs.append(t[0])
-                        rdkit_ligands.append(t[1])
-                    pbar.update()
-            if self.num_workers > 1: p.__exit__(None, None, None)
+            attempted = 0
+            skipped = 0
+            skipped_by_reason = {}
 
-            with open(os.path.join(self.lig_cache_path, f"ligands{i}.pkl"), 'wb') as f:
-                pickle.dump((ligand_graphs), f)
-            with open(os.path.join(self.lig_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+            stop_event = threading.Event()
+
+            def _watchdog_lig(stop_event, ligand_graphs_ref):
+                while not stop_event.is_set():
+                    tqdm.write(f"[watchdog] lig batch {i}, processed {len(ligand_graphs_ref)}")
+                    stop_event.wait(30)
+
+            t = threading.Thread(target=_watchdog_lig, args=(stop_event, ligand_graphs), daemon=True)
+            t.start()
+
+            try:
+                                                                                           
+                with tqdm(
+                    total=len(complex_names),
+                    desc=f'building ligands {i}/{len(complex_names_all)//1000+1}',
+                    file=sys.stdout,
+                    dynamic_ncols=True,
+                    leave=True,
+                ) as pbar:
+                    for name in complex_names:
+                        attempted += 1
+                        if self.split == 'train':
+                            lig_path = os.path.join(self.moad_dir, 'pdb_superligand', name + '.pdb')
+                        else:
+                            lig_path = os.path.join(self.moad_dir, 'pdb_ligand', name + '.pdb')
+
+                        if not os.path.exists(lig_path):
+                            skipped += 1
+                            skipped_by_reason['missing_file'] = skipped_by_reason.get('missing_file', 0) + 1
+                            pbar.update(1)
+                            continue
+
+                        raw = {"name": name, "lig_path": lig_path}
+                        out = self.build_ligand_graph(raw)
+                        del raw
+                        if out is None:
+                            skipped += 1
+                            skipped_by_reason['build_failed'] = skipped_by_reason.get('build_failed', 0) + 1
+                            pbar.update(1)
+                            continue
+                        ligand_graphs.append(out[0])
+                        rdkit_ligands.append(out[1])
+                        pbar.update(1)
+
+                                                              
+                for idx in range(len(ligand_graphs)):
+                    try:
+                        ligand_graphs[idx] = _scrub_graph_schema(ligand_graphs[idx])
+                    except Exception:
+                        pass
+
+                with open(batch_lig_path, 'wb') as f:
+                    pickle.dump(ligand_graphs, f)
+                with open(batch_rdkit_path, 'wb') as f:
+                    pickle.dump(rdkit_ligands, f)
+                del ligand_graphs, rdkit_ligands
+                import gc
+                gc.collect()
+            finally:
+                                                        
+                try:
+                    stop_event.set()
+                    t.join(timeout=5)
+                except Exception:
+                    pass
+
+                print('Attempted:', attempted)
+                print('Skipped:', skipped)
+                print('Skip reasons:', skipped_by_reason)
+                             
+                stats = {
+                    'attempted': attempted,
+                    'skipped': skipped,
+                    'skipped_by_reason': skipped_by_reason,
+                }
+                with open(os.path.join(self.lig_cache_path, f"ligands_batch_{i}_stats.pkl"), 'wb') as sf:
+                    pickle.dump(stats, sf)
+        del self._preprocessing_running
 
         ligand_graphs_all = []
-        for i in range(len(complex_names_all)//1000+1):
-            with open(os.path.join(self.lig_cache_path, f"ligands{i}.pkl"), 'rb') as f:
-                l = pickle.load(f)
-                ligand_graphs_all.extend(l)
-        with open(os.path.join(self.lig_cache_path, f"ligands.pkl"), 'wb') as f:
-            pickle.dump((ligand_graphs_all), f)
+        for i in range(n_batches):
+            p = os.path.join(self.lig_cache_path, f"ligands_batch_{i}.pkl")
+            if not os.path.exists(p):
+                continue
+            with open(p, "rb") as f:
+                ligand_graphs_all.extend(pickle.load(f))
+        with open(os.path.join(self.lig_cache_path, "ligands.pkl"), "wb") as f:
+            pickle.dump(ligand_graphs_all, f)
 
         rdkit_ligands_all = []
-        for i in range(len(complex_names_all) // 1000 + 1):
-            with open(os.path.join(self.lig_cache_path, f"rdkit_ligands{i}.pkl"), 'rb') as f:
-                l = pickle.load(f)
-                rdkit_ligands_all.extend(l)
-        with open(os.path.join(self.lig_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
-            pickle.dump((rdkit_ligands_all), f)
+        for i in range(n_batches):
+            p = os.path.join(self.lig_cache_path, f"rdkit_ligands_batch_{i}.pkl")
+            if not os.path.exists(p):
+                continue
+            with open(p, "rb") as f:
+                rdkit_ligands_all.extend(pickle.load(f))
+        with open(os.path.join(self.lig_cache_path, "rdkit_ligands.pkl"), "wb") as f:
+            pickle.dump(rdkit_ligands_all, f)
 
-    def get_ligand(self, name):
-        if self.split == 'train':
-            lig_path = os.path.join(self.moad_dir, 'pdb_superligand', name + '.pdb')
-        else:
-            lig_path = os.path.join(self.moad_dir, 'pdb_ligand', name + '.pdb')
 
-        if not os.path.exists(lig_path):
-            print("Ligand not found", name, lig_path)
+    def build_ligand_graph(self, raw):
+                                                             
+        if mp.current_process().name != "MainProcess":
+            raise RuntimeError(
+                "Graph construction must run in the main process only."
+            )
+        name = raw["name"]
+        lig = Chem.MolFromPDBFile(raw.get("lig_path"))
+        if lig is None:
             return None
 
-        # read pickle
-        lig = Chem.MolFromPDBFile(lig_path)
-
         if self.max_lig_size is not None and lig.GetNumHeavyAtoms() > self.max_lig_size:
-            print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. Not including {name} in preprocessed data.')
             return None
 
         try:
             if self.matching:
                 smile = Chem.MolToSmiles(lig)
                 if '.' in smile:
-                    print(f'Ligand {name} has multiple fragments and we are doing matching. Not including {name} in preprocessed data.')
                     return None
 
             complex_graph = HeteroData()
@@ -523,13 +1135,14 @@ class MOAD(Dataset):
                 new_file = os.path.join(self.moad_dir, 'pdb_ligand', f'{nsplit[0]}_{nsplit[1]}_{nsplit[2]}_{i}.pdb')
                 if os.path.exists(new_file):
                     if i != int(nsplit[3]):
-                        lig = Chem.MolFromPDBFile(new_file)
-                        lig = RemoveHs(lig, sanitize=True)
-                        other_positions.append(lig.GetConformer().GetPositions())
+                        lig_alt = Chem.MolFromPDBFile(new_file)
+                        lig_alt = RemoveHs(lig_alt, sanitize=True)
+                        other_positions.append(lig_alt.GetConformer().GetPositions())
                 else:
                     break
             complex_graph['ligand'].orig_pos = np.asarray(other_positions)
 
+        complex_graph = _scrub_graph_schema(complex_graph)
         return complex_graph, lig
 
 
@@ -569,4 +1182,3 @@ def print_statistics(dataset):
             print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
 
     return
-

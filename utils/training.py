@@ -146,9 +146,11 @@ class AverageMeter():
                 self.acc[self.types[type_idx]] += v.sum().cpu() if self.unpooled_metrics else v.cpu()
         else:
             for type_idx, v in enumerate(vals):
-                self.count[type_idx].index_add_(0, interval_idx[type_idx], torch.ones(len(v)))
-                if not torch.allclose(v, torch.tensor(0.0)):
-                    self.acc[self.types[type_idx]].index_add_(0, interval_idx[type_idx], v)
+                # Ensure tensors used for indexing/accumulation are on CPU to avoid device mismatch
+                v_cpu = v.cpu()
+                self.count[type_idx].index_add_(0, interval_idx[type_idx].cpu(), torch.ones(len(v_cpu)))
+                if not torch.allclose(v_cpu, torch.tensor(0.0)):
+                    self.acc[self.types[type_idx]].index_add_(0, interval_idx[type_idx].cpu(), v_cpu)
 
     def summary(self):
         if self.intervals == 1:
@@ -247,6 +249,11 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
 
     for data in tqdm(loader, total=len(loader)):
         try:
+            # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
+            if isinstance(data, list):
+                data = Batch.from_data_list(data)
+            # move the whole batch to device (keep as a Batch), so model.forward receives tensors on the same device
+            data = data.to(device) if device.type == 'cuda' else data
             with torch.no_grad():
                 tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)

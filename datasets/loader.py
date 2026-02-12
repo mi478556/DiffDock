@@ -66,7 +66,7 @@ def construct_loader(args, t_to_sigma, device):
         if args.dataset == 'pdbsidechain':
             train_dataset = train_dataset3
             val_dataset = PDBSidechain(cache_path=args.cache_path, split='val', multiplicity=args.val_multiplicity, **common_args)
-        loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
+        loader_class = DataLoader
 
     if args.dataset in ['pdbbind', 'moad', 'generalisation', 'distillation']:
         common_args = {'transform': transform, 'limit_complexes': args.limit_complexes,
@@ -118,7 +118,7 @@ def construct_loader(args, t_to_sigma, device):
                                unroll_clusters=args.unroll_clusters, root=args.moad_dir,
                                esm_embeddings_path=args.moad_esm_embeddings_path, require_ligand=True, **common_args)
 
-        loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
+        loader_class = DataLoader
 
     train_loader = loader_class(dataset=train_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
     val_loader = loader_class(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=False, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
