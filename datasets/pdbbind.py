@@ -431,7 +431,7 @@ class PreprocessingWatchdog:
             item_info = f"current={s['current_item']}"
 
         msg = (
-            f"[watchdog:{self.name}] "
+            f"[watchdog_pdbbind:{self.name}] "
             f"{batch_info} "
             f"attempted={s['attempted']} "
             f"ok={s['ok']} "

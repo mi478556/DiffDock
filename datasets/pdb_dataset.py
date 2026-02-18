@@ -614,13 +614,6 @@ class PDBSidechain(Dataset):
         self.vandermers = None
         print("[PDBSidechain] build_cache_only done", flush=True)
 
-                                              
-        # Completed cache build; original code recorded a marker file here, removed.
-
-                                                              
-    # Removed cache lock / subprocess helper methods and ensure_cache logic per restore request.
-
-    # duplicate `load()` removed — keep single implementation further below
 
     def _finalize_loaded(self):
         # Filter proteins by vandermers availability (same logic as deprecated code)

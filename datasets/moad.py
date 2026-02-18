@@ -694,7 +694,7 @@ class MOAD(Dataset):
 
             def _watchdog(stop_event):
                 while not stop_event.is_set():
-                    tqdm.write(f"[watchdog] batch {i}, processed {len(receptor_graphs)}")
+                    tqdm.write(f"[watchdog_MOAD] batch {i}, processed {len(receptor_graphs)}")
                     stop_event.wait(30)
 
             try:

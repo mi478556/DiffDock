@@ -165,6 +165,7 @@ temp5.py
 temp6.py
 temp7.py
 esm
+debug_logs/
 
 
 # ignore torsion-specific caches produced by PDBBind when matching is enabled
