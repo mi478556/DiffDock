@@ -307,25 +307,6 @@ def _build_receptor_from_name(args):
         except Exception:
             return ("skip", "receptor_extract_fail")
 
-                                                              
-        if emb is not None:
-            if "receptor" not in cg.node_types:
-                return ("skip", "no_receptor")
-
-                                                             
-            x = getattr(cg["receptor"], "x", None)
-            if x is None:
-                return ("skip", "missing_embeddings")
-
-            try:
-                if x.shape[0] != cg["receptor"].pos.shape[0]:
-                    return ("skip", "embedding_misalignment")
-                esm_dim = cfg.get("esm_dim", None)
-                if esm_dim is not None:
-                    if x.shape[1] < esm_dim:
-                        return ("skip", "missing_esm_channels")
-            except Exception:
-                return ("skip", "missing_embeddings")
 
         try:
             if "receptor" not in cg.node_types:
@@ -644,14 +625,6 @@ class MOAD(Dataset):
 
             g = self.get_by_name(ligand_name, cluster)
 
-                                                                                                   
-            if self.esm_embeddings_path is not None:
-                if not self._has_valid_receptor_embeddings(g):
-                              
-                    idx = random.randint(0, self.len())
-                    continue
-
-                                                                                                              
             return g
 
         raise RuntimeError("MOAD.get failed to sample a valid graph with embeddings enabled")
@@ -663,38 +636,7 @@ class MOAD(Dataset):
                 complexes[ligand_name] = self.get_by_name(ligand_name, cluster)
         return complexes
 
-    def _has_valid_receptor_embeddings(self, g: HeteroData) -> bool:
-                                                
-        if self.esm_embeddings_path is None:
-            return True
 
-                                       
-        if "receptor" not in getattr(g, "node_types", []):
-            return False
-
-        rec = g["receptor"]
-
-                             
-        x = getattr(rec, "x", None)
-        pos = getattr(rec, "pos", None)
-        if x is None or pos is None:
-            return False
-
-                                              
-        try:
-            if x.dim() != 2:
-                return False
-            if x.shape[0] != pos.shape[0]:
-                return False
-        except Exception:
-            return False
-
-                                            
-        if getattr(self, "expected_esm_dim", None) is not None:
-            if x.shape[1] != int(self.expected_esm_dim):
-                return False
-
-        return True
 
     def preprocessing_receptors(self):
         print(f'Processing receptors from [{self.split}] and saving it to [{self.prot_cache_path}]')
@@ -729,8 +671,6 @@ class MOAD(Dataset):
             emb_dim = None
                                                   
         self.esm_dim = emb_dim
-                                                                    
-        self.expected_esm_dim = int(emb_dim) if emb_dim is not None else None
 
                                                                                                             
         n_batches = (len(receptor_names_all) + 999) // 1000
@@ -924,23 +864,7 @@ class MOAD(Dataset):
                     l = [t for t in l if t.get("receptor_name", None) in receptors_to_keep]
 
                                                                       
-                if self.esm_embeddings_path is not None and getattr(self, "expected_esm_dim", None) is None:
-                    for t in l:
-                        try:
-                            if "receptor" in getattr(t, "node_types", []):
-                                x = getattr(t["receptor"], "x", None)
-                                if x is not None and hasattr(x, "shape") and len(x.shape) == 2:
-                                    self.expected_esm_dim = int(x.shape[1])
-                                    break
-                        except Exception:
-                            continue
-
-                                                                                
-                if self.esm_embeddings_path is not None:
-                    before = len(l)
-                    l = [t for t in l if self._has_valid_receptor_embeddings(t)]
-                    if before != len(l):
-                        print(f"Filtered {before - len(l)} receptors in batch {i} due to invalid/missing embeddings")
+                # No embedding validation here; accept whatever moad_extract_receptor_structure produced
 
                 receptor_graphs_all.extend(l)
 
