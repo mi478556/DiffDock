@@ -948,18 +948,34 @@ class PDBBind(Dataset):
 
     def _load_cache(self):
         graphs_all, ligs_all = [], []
-        info = pickle.load(open(os.path.join(self.full_cache_path, "heterographs.pkl"), "rb"))
 
+        meta_path = os.path.join(self.full_cache_path, "heterographs.pkl")
+        info = pickle.load(open(meta_path, "rb"))
+
+        # Legacy: single-file list format
         if isinstance(info, list):
+            tqdm.write(f"[PDBBind] loading cache (legacy list) from {self.full_cache_path}")
             return info, []
 
-        for i in range(info["num_batches"]):
-            graphs_all.extend(
-                pickle.load(open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), "rb"))
-            )
-            ligs_all.extend(
-                pickle.load(open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), "rb"), )
-            )
+        # Batched format
+        num_batches = int(info["num_batches"])
+
+        tqdm.write(f"[PDBBind] loading cache from {self.full_cache_path}")
+
+        for i in tqdm(
+            range(num_batches),
+            desc="load PDBBind cache",
+            unit="batch",
+            leave=True,
+            position=0,
+            mininterval=0.2,
+        ):
+            graphs_path = os.path.join(self.full_cache_path, f"heterographs{i}.pkl")
+            ligs_path = os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl")
+
+            graphs_all.extend(pickle.load(open(graphs_path, "rb")))
+            ligs_all.extend(pickle.load(open(ligs_path, "rb")))
+
         return graphs_all, ligs_all
 
     def len(self):

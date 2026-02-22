@@ -293,8 +293,8 @@ class PDBSidechain(Dataset):
             pdb_counts = torch.ones(1000)
             for contacts in self.vandermers.values():
                 pdb_counts.index_add_(0, contacts, torch.ones(contacts.shape))
-            print(pdbbind_counts[:30])
-            print(pdb_counts[:30])
+            tqdm.write(str(pdbbind_counts[:30]))
+            tqdm.write(str(pdb_counts[:30]))
 
             self.probabilities = pdbbind_counts / pdb_counts
             self.probabilities[:7] = 0
@@ -481,10 +481,16 @@ class PDBSidechain(Dataset):
         self.protein_graphs = []
         self.vandermers = {}
         total_recovered = 0
-        print(f'Loading {len(self.chains_in_cluster)} protein graphs.')
+        tqdm.write(f"Loading {len(self.chains_in_cluster)} protein graphs.")
         list_indices = list(range(len(self.chains_in_cluster) // 10000 + 1))
         random.shuffle(list_indices)
-        for i in tqdm(list_indices, desc="load cached protein_graphs", unit="batch"):
+        for i in tqdm(
+            list_indices,
+            desc="load cached protein_graphs",
+            unit="batch",
+            position=0,
+            leave=True,
+        ):
             ppath = os.path.join(self.cache_path, f"protein_graphs{i}.pkl")
             if not os.path.exists(ppath):
                 raise RuntimeError(f"Missing protein graphs batch: {ppath}")
@@ -508,7 +514,7 @@ class PDBSidechain(Dataset):
                         vandermers[k] = v.long()
                     self.vandermers.update(vandermers)
 
-        print(f"Kept {len(self.protein_graphs)} proteins out of {len(self.chains_in_cluster)} total")
+        tqdm.write(f"Kept {len(self.protein_graphs)} proteins out of {len(self.chains_in_cluster)} total")
         return
 
     def load_cached_protein_graphs(self):
@@ -536,14 +542,19 @@ class PDBSidechain(Dataset):
         return self.check_all_proteins() and self.check_all_vandermers()
 
     def build_vandermers_only(self):
-
-        print(f"[PDBSidechain] build_vandermers_only start pid={os.getpid()} cache_path={self.cache_path}", flush=True)
+        tqdm.write(f"[PDBSidechain] build_vandermers_only start pid={os.getpid()} cache_path={self.cache_path}")
         if not self.check_all_proteins():
             raise RuntimeError("Protein graphs missing; run preprocess() first or build protein graphs before vandermers")
 
         list_indices = list(range(len(self.chains_in_cluster) // 10000 + 1))
         random.shuffle(list_indices)
-        for i in tqdm(list_indices, desc="build vandermers batches", unit="batch"):
+        for i in tqdm(
+            list_indices,
+            desc="build vandermers batches",
+            unit="batch",
+            position=0,
+            leave=True,
+        ):
             out_vdm = os.path.join(self.cache_path, f'vandermers{i}_{self.vandermers_max_dist}_{self.vandermers_buffer_residue_num}.pkl')
             if os.path.exists(out_vdm):
                 continue
@@ -564,16 +575,36 @@ class PDBSidechain(Dataset):
             arguments = ((g.name, self.vandermers_max_dist, self.vandermers_buffer_residue_num) for g in l)
 
             if self.num_workers > 1:
-                with Pool(self.num_workers, initializer=_vandermers_init, initargs=(coords_by_name, seq_by_name)) as p:
-                    with tqdm(total=len(l), desc=f'computing vandermers {i}') as pbar:
-                        for name, counts in p.imap_unordered(identify_valid_vandermers_fast_raw, arguments, chunksize=1):
-                            vandermers[name] = counts
-                            pbar.update()
-            else:
-                with tqdm(total=len(l), desc=f'computing vandermers {i}') as pbar:
-                    for name, counts in map(identify_valid_vandermers_fast_raw, arguments):
+                with Pool(
+                    self.num_workers,
+                    initializer=_vandermers_init,
+                    initargs=(coords_by_name, seq_by_name),
+                ) as p:
+
+                    for name, counts in tqdm(
+                        p.imap_unordered(
+                            identify_valid_vandermers_fast_raw,
+                            arguments,
+                            chunksize=1,
+                        ),
+                        total=len(l),
+                        desc=f"computing vandermers {i}",
+                        unit="prot",
+                        position=1,
+                        leave=False,
+                        mininterval=0.2,
+                    ):
                         vandermers[name] = counts
-                        pbar.update()
+            else:
+                for name, counts in tqdm(
+                    map(identify_valid_vandermers_fast_raw, arguments),
+                    total=len(l),
+                    desc=f"computing vandermers {i}",
+                    unit="prot",
+                    position=1,
+                    leave=False,
+                ):
+                    vandermers[name] = counts
 
                               
             for k, v in list(vandermers.items()):
@@ -585,83 +616,79 @@ class PDBSidechain(Dataset):
             t0 = time.time()
             with open(out_vdm, 'wb') as f:
                 pickle.dump(vandermers, f)
-            print(f"Saved vandermers batch {i}: {len(vandermers)} items -> {out_vdm} in {time.time()-t0:.1f}s")
+            tqdm.write(
+                f"Saved vandermers batch {i}: {len(vandermers)} items "
+                f"-> {out_vdm} in {time.time()-t0:.1f}s"
+            )
 
                                 
             coords_by_name = None
             seq_by_name = None
             del l
             gc.collect()
-        print(f"[PDBSidechain] build_vandermers_only done", flush=True)
+        tqdm.write(f"[PDBSidechain] build_vandermers_only done")
 
     def build_cache_only(self):
-
-        print(f"[PDBSidechain] build_cache_only start pid={os.getpid()} cache_path={self.cache_path} vandermers_extraction={self.vandermers_extraction}", flush=True)
+        tqdm.write(f"[PDBSidechain] build_cache_only start pid={os.getpid()} cache_path={self.cache_path} vandermers_extraction={self.vandermers_extraction}")
         os.makedirs(self.cache_path, exist_ok=True)
-
         if not self.check_all_proteins():
-            print("[PDBSidechain] running preprocess() to build protein_graphs", flush=True)
+            tqdm.write("[PDBSidechain] running preprocess() to build protein_graphs")
             self.preprocess()
-            print("[PDBSidechain] preprocess() finished", flush=True)
+            tqdm.write("[PDBSidechain] preprocess() finished")
 
         if self.vandermers_extraction and not self.check_all_vandermers():
-            print("[PDBSidechain] running build_vandermers_only()", flush=True)
+            tqdm.write("[PDBSidechain] running build_vandermers_only()")
             self.build_vandermers_only()
-            print("[PDBSidechain] build_vandermers_only() finished", flush=True)
+            tqdm.write("[PDBSidechain] build_vandermers_only() finished")
 
-                                       
         self.protein_graphs = None
         self.vandermers = None
-        print("[PDBSidechain] build_cache_only done", flush=True)
-
+        tqdm.write("[PDBSidechain] build_cache_only done")
 
     def _finalize_loaded(self):
-        # Filter proteins by vandermers availability (same logic as deprecated code)
-        filtered = []
-        if self.vandermers_extraction:
-            for g in self.protein_graphs:
-                try:
-                    v = self.vandermers.get(g.name, None)
-                    if v is not None and torch.any(v >= 10):
-                        filtered.append(g)
-                except Exception:
-                    continue
-            print(f"Computed vandermers and kept {len(filtered)} proteins out of {len(self.protein_graphs)}")
-        else:
-            filtered = self.protein_graphs
+        if self.protein_graphs is None:
+            self.protein_graphs = []
+        if self.vandermers is None:
+            self.vandermers = {}
 
-        # Filter proteins by embeddings availability (same logic as deprecated code)
-        second_filter = []
-        if self.sequences_to_embeddings is None:
-            second_filter = filtered
+        filtered_proteins = []
+        if self.vandermers_extraction:
+            min_contacts = max(int(self.vandermers_min_contacts or 0), 10)
+            for complex_graph in self.protein_graphs:
+                contacts = self.vandermers.get(complex_graph.name)
+                if contacts is not None and torch.any(contacts >= min_contacts):
+                    filtered_proteins.append(complex_graph)
+            tqdm.write(
+                f"Computed vandermers and kept {len(filtered_proteins)} proteins "
+                f"out of {len(self.protein_graphs)}"
+            )
         else:
-            for g in filtered:
-                try:
-                    if g.orig_seq in self.sequences_to_embeddings:
-                        second_filter.append(g)
-                except Exception:
-                    continue
-            print(f"Checked embeddings available and kept {len(second_filter)} proteins out of {len(filtered)}")
+            filtered_proteins = self.protein_graphs
+
+        second_filter = []
+        for complex_graph in filtered_proteins:
+            if self.sequences_to_embeddings is None or complex_graph.orig_seq in self.sequences_to_embeddings:
+                second_filter.append(complex_graph)
+        tqdm.write(
+            f"Checked embeddings available and kept {len(second_filter)} proteins "
+            f"out of {len(filtered_proteins)}"
+        )
 
         self.protein_graphs = second_filter
-
-        # Build cluster index structures (same as deprecated code)
-        # cluster stored as a graph-level key: g["cluster"] (attribute access g.cluster also often works)
-        self.split_clusters = list(set([int(g["cluster"]) for g in self.protein_graphs]))
+        self.split_clusters = sorted(set(g.cluster for g in self.protein_graphs))
         self.cluster_to_complexes = {c: [] for c in self.split_clusters}
-
-        for g in self.protein_graphs:
-            self.cluster_to_complexes[int(g["cluster"])].append(g)
-
-        # Remove empty clusters
+        for protein_graph in self.protein_graphs:
+            self.cluster_to_complexes[protein_graph["cluster"]].append(protein_graph)
         self.split_clusters = [c for c in self.split_clusters if len(self.cluster_to_complexes[c]) > 0]
+        self.name_to_complex = {protein_graph.name: protein_graph for protein_graph in self.protein_graphs}
 
-        print("Total elements in set", len(self.split_clusters) * self.multiplicity // self.merge_clusters)
-
-        self.name_to_complex = {g.name: g for g in self.protein_graphs}
-
-        # Build probabilities table used by get()
+        total_len = len(self.split_clusters) * self.multiplicity // self.merge_clusters
+        tqdm.write(f"Total elements in set {total_len}")
         self.define_probabilities()
+
+        if self.add_random_ligand:
+            with open('data/smiles_list.csv', 'r') as f:
+                self.smiles_list = [line.split(',')[0] for line in f.readlines()]
 
     def load(self):
         if self._is_loaded:
@@ -680,53 +707,64 @@ class PDBSidechain(Dataset):
         self._is_loaded = True
 
     def preprocess(self):
-                                                                                        
-                                                                                        
         list_indices = list(range(len(self.chains_in_cluster) // 10000 + 1))
         random.shuffle(list_indices)
 
-        for i in tqdm(list_indices, desc="preprocess batches", unit="batch"):
+        # Stage-level progress bar
+        for i in tqdm(
+            list_indices,
+            desc="preprocess batches",
+            unit="batch",
+            position=0,
+            leave=True,
+        ):
             out_path = os.path.join(self.cache_path, f"protein_graphs{i}.pkl")
             if os.path.exists(out_path):
                 continue
 
             chains = self.chains_in_cluster[10000 * i:10000 * (i + 1)]
+            tqdm.write(f"Loading batch {i}, {len(chains)} chains")
 
-            print(f"Loading batch {i}, {len(chains)} chains")
-
-                                                                        
-            raws = self.load_chain_batch(chains, desc=f"load raw batch {i}")
+            raws = self.load_chain_batch(chains)
 
             protein_graphs = []
-            for raw in tqdm(raws, desc=f"build graphs batch {i}", unit="prot", leave=False):
+
+            # Inner protein-level bar
+            for raw in tqdm(
+                raws,
+                desc=f"build graphs batch {i}",
+                unit="prot",
+                position=1,
+                leave=False,
+            ):
                 try:
                     g = self.build_graph_from_raw(raw)
                 except Exception:
-                                                                              
                     continue
 
                 if g is not None:
                     protein_graphs.append(g)
 
-                                                               
             t0 = time.time()
             with open(out_path, "wb") as f:
                 pickle.dump(protein_graphs, f)
-            print(f"Saved batch {i}: {len(protein_graphs)} graphs -> {out_path} in {time.time()-t0:.1f}s")
 
-                              
+            tqdm.write(
+                f"Saved batch {i}: {len(protein_graphs)} graphs -> {out_path} "
+                f"in {time.time()-t0:.1f}s"
+            )
+
             del raws
             del protein_graphs
             gc.collect()
 
-        print("Finished preprocessing and saving protein graphs")
+        tqdm.write("Finished preprocessing and saving protein graphs")
 
     def load_chain_batch(self, chains, desc=None):
 
 
         raws = []
-        it = tqdm(chains, desc=desc or "loading raw chains", unit="chain", leave=False)
-        for chain, cluster in it:
+        for chain, cluster in chains:
             path = self.root + f"/pdb/{chain[1:3]}/{chain}.pt"
             if not os.path.exists(path):
                                     
