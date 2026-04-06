@@ -114,9 +114,11 @@ def loss_function(
     # stock DiffDock weighted loss
     loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
 
+    rank_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+
     # add our low-rank contact loss, computed from a one-step denoised pose
     if rank_weight > 0.0:
-        lr_loss = low_rank_contact_loss(
+        rank_loss = low_rank_contact_loss(
             data=data,
             tr_pred=tr_pred.to(pred_device), rot_pred=rot_pred.to(pred_device),
             tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
@@ -126,9 +128,9 @@ def loss_function(
             alpha_rot=float(rank_alpha_rot),
             use_receptor_atoms=True
         )
-        loss = loss + rank_weight * lr_loss
+        loss = loss + rank_weight * rank_loss
 
-    return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
+    return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), rank_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
 
 
 class AverageMeter():
@@ -173,7 +175,7 @@ class AverageMeter():
 
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1):
     model.train()
-    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
+    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'backbone_loss', 'sidechain_loss',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
     accum_count = 0
     optimizer.zero_grad()
@@ -258,13 +260,13 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
-    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
+    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'backbone_loss', 'sidechain_loss',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
-            ['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
+            ['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'backbone_loss', 'sidechain_loss',
              'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
             unpooled_metrics=True, intervals=10)
 
@@ -288,7 +290,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 sigma_index_rot = torch.round(complex_t_rot.cpu() * (10 - 1)).long()
                 sigma_index_tor = torch.round(complex_t_tor.cpu() * (10 - 1)).long()
                 meter_all.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]],
-                    [sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr,
+                    [sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr, sigma_index_tr,
                      sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr])
 
         except RuntimeError as e:

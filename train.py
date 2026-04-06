@@ -54,8 +54,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             import csv as _csv
             from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
             csv_path = os.path.join(run_dir, 'training_log.csv')
-            csv_header = ['epoch', 'train_loss', 'tr_loss', 'rot_loss', 'tor_loss',
-                          'val_loss', 'val_tr', 'val_rot', 'val_tor',
+            csv_header = ['epoch', 'train_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+                          'val_loss', 'val_tr', 'val_rot', 'val_tor', 'val_rank_loss',
                           'valinf_min_rmsds_lt2', 'valinf_min_rmsds_lt5', 'lr', 'timestamp']
             csv_exists = os.path.exists(csv_path)
             csv_file = open(csv_path, 'a', newline='')
@@ -107,16 +107,16 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             ema_weights if epoch > freeze_params else None,
             grad_accum_steps=args.grad_accum_steps,
         )
-        print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}  lr {:.4f}"
+        print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   sc {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
-                      train_losses['tor_loss'], train_losses['sidechain_loss'], optimizer.param_groups[0]['lr']))
+                      train_losses['tor_loss'], train_losses['rank_loss'], train_losses['sidechain_loss'], optimizer.param_groups[0]['lr']))
 
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
         val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
-        print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}"
-              .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['sidechain_loss']))
+        print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   sc {:.4f}"
+              .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['rank_loss'], val_losses['sidechain_loss']))
 
         if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
             inf_dataset = [val_loader.dataset.get(i) for i in range(min(args.num_inference_complexes, val_loader.dataset.__len__()))]
@@ -209,10 +209,12 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     train_losses.get('tr_loss') if isinstance(train_losses, dict) else None,
                     train_losses.get('rot_loss') if isinstance(train_losses, dict) else None,
                     train_losses.get('tor_loss') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_loss') if isinstance(train_losses, dict) else None,
                     val_losses.get('loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('tr_loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('rot_loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('tor_loss') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_loss') if isinstance(val_losses, dict) else None,
                     valinf_min_rmsds_lt2,
                     valinf_min_rmsds_lt5,
                     current_lr,
@@ -230,9 +232,13 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     if current_lr is not None:
                         tb_writer.add_scalar('train/lr', current_lr, epoch)
                     if isinstance(train_losses, dict):
-                        for k in ['tr_loss', 'rot_loss', 'tor_loss']:
+                        for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss']:
                             if train_losses.get(k) is not None:
                                 tb_writer.add_scalar(f'train/{k}', train_losses.get(k), epoch)
+                    if isinstance(val_losses, dict):
+                        for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss']:
+                            if val_losses.get(k) is not None:
+                                tb_writer.add_scalar(f'val/{k}', val_losses.get(k), epoch)
                     tb_writer.flush()
             except Exception as e:
                 print('Warning: failed to write epoch logs', e)
