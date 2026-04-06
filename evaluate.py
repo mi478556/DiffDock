@@ -32,6 +32,7 @@ from tqdm import tqdm
 RDLogger.DisableLog('rdApp.*')
 import yaml
 import pickle
+import traceback
 
 
 def get_dataset(args, model_args, confidence=False):
@@ -528,6 +529,7 @@ if __name__ == '__main__':
                 success = 1
             except Exception as e:
                 print("Failed on", orig_complex_graph["name"], e)
+                traceback.print_exc()
                 success -= 1
                 if bs > 1:
                     bs = bs // 2
@@ -591,6 +593,10 @@ if __name__ == '__main__':
         np.save(f'{args.out_dir}/{overlap}complex_names.npy', np.array(names))
         np.save(f'{args.out_dir}/{overlap}gnina_rmsds.npy', gnina_rmsds)
         np.save(f'{args.out_dir}/{overlap}gnina_score.npy', gnina_score)
+
+        if len(rmsds) == 0:
+            print(f"Skipping {overlap or 'full'} metrics because no complexes were evaluated.")
+            continue
 
         performance_metrics.update({
             f'{overlap}run_times_std': run_times.std().__round__(2),

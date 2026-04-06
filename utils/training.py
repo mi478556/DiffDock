@@ -171,10 +171,12 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1):
     model.train()
     meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
+    accum_count = 0
+    optimizer.zero_grad()
 
     for data in tqdm(loader, total=len(loader)):
         # determine if this is a single-example batch (support list or Batch)
@@ -189,7 +191,6 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             if has_bn:
                 print("Skipping batch of size 1 since otherwise batchnorm would not work.")
                 continue
-        optimizer.zero_grad()
         # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
         if isinstance(data, list):
             data = Batch.from_data_list(data)
@@ -207,10 +208,18 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 names = data.name if device.type == 'cpu' else [d.name for d in data]
                 print("Nan loss, skipping batch with complexes", names)
                 continue
-            loss.backward()
-            optimizer.step()
-            if ema_weights is not None: ema_weights.update(model.parameters())
-            meter.add([loss.cpu().detach(), *loss_tuple[1:]])
+            scaled_loss = loss / grad_accum_steps
+            scaled_loss.backward()
+            accum_count += 1
+
+            if accum_count == grad_accum_steps:
+                optimizer.step()
+                optimizer.zero_grad()
+                if ema_weights is not None:
+                    ema_weights.update(model.parameters())
+                accum_count = 0
+
+            meter.add([loss.detach().cpu(), *loss_tuple[1:]])
             
         except RuntimeError as e:
             if 'out of memory' in str(e):
@@ -219,6 +228,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     if p.grad is not None:
                         del p.grad  # free some memory
                 torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                accum_count = 0
                 continue
             elif 'Input mismatch' in str(e):
                 print('| WARNING: weird torch_cluster error, skipping batch')
@@ -226,11 +237,21 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     if p.grad is not None:
                         del p.grad  # free some memory
                 torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                accum_count = 0
                 continue
             else:
                 #raise e
                 print(e)
+                optimizer.zero_grad()
+                accum_count = 0
                 continue
+
+    if accum_count > 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        if ema_weights is not None:
+            ema_weights.update(model.parameters())
             
     return meter.summary()
 

@@ -52,6 +52,7 @@ def parse_train_args():
     parser.add_argument('--num_workers', type=int, default=1, help='Number of workers for preprocessing')
     parser.add_argument('--use_ema', action='store_true', default=False, help='Whether or not to use ema for the model weights')
     parser.add_argument('--ema_rate', type=float, default=0.999, help='decay rate for the exponential moving average model parameters ')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of micro-batches to accumulate before optimizer step')
     parser.add_argument('--enable_logging', action='store_true', default=False, help='Enable per-epoch CSV and TensorBoard logging into the run_dir')
 
     # Dataset
@@ -157,6 +158,7 @@ def parse_train_args():
 
     args = parser.parse_args()
 
+    assert args.grad_accum_steps >= 1
     assert (not args.dynamic_max_cross) or (args.tr_sigma_max * 3 + 20 < args.cross_max_distance)
     assert args.esm_embeddings_model is None or args.esm_embeddings_path is None
     return args

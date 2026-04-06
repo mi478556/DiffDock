@@ -422,8 +422,13 @@ class CGModel(torch.nn.Module):
         edge_sigma = tor_sigma[data['ligand'].batch][data['ligand', 'ligand'].edge_index[0]][data['ligand'].edge_mask]
 
         if self.scale_by_sigma:
-            tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
-                                             .to(data['ligand'].x.device))
+            sigma_scale = torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
+                                     .to(data['ligand'].x.device))
+            if tor_pred.shape[0] != sigma_scale.shape[0]:
+                n = min(tor_pred.shape[0], sigma_scale.shape[0])
+                tor_pred = tor_pred[:n]
+                sigma_scale = sigma_scale[:n]
+            tor_pred = tor_pred * sigma_scale
         return tr_pred, rot_pred, tor_pred, sidechain_pred
 
     def torsional_forward(self, data):
@@ -455,8 +460,13 @@ class CGModel(torch.nn.Module):
         edge_sigma = tor_sigma[data['ligand'].batch][data['ligand', 'ligand'].edge_index[0]][data['ligand'].edge_mask]
 
         if self.scale_by_sigma:
-            tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
-                                             .to(data['ligand'].x.device))
+            sigma_scale = torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
+                                     .to(data['ligand'].x.device))
+            if tor_pred.shape[0] != sigma_scale.shape[0]:
+                n = min(tor_pred.shape[0], sigma_scale.shape[0])
+                tor_pred = tor_pred[:n]
+                sigma_scale = sigma_scale[:n]
+            tor_pred = tor_pred * sigma_scale
         return 0, 0, tor_pred, 0
 
     def get_edge_weight(self, edge_vec, max_norm):
@@ -640,4 +650,3 @@ class CGModel(torch.nn.Module):
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
         return bonds, edge_index, edge_attr, edge_sh, edge_weight
-

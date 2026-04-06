@@ -97,7 +97,16 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_alpha_tr=args.rank_alpha_tr,
             rank_alpha_rot=args.rank_alpha_rot,
         )
-        train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights if epoch > freeze_params else None)
+        train_losses = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            t_to_sigma,
+            loss_fn,
+            ema_weights if epoch > freeze_params else None,
+            grad_accum_steps=args.grad_accum_steps,
+        )
         print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                       train_losses['tor_loss'], train_losses['sidechain_loss'], optimizer.param_groups[0]['lr']))
