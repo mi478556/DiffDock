@@ -476,10 +476,10 @@ class AAModel(torch.nn.Module):
 
         # adjust the magniture of the score vectors
         tr_norm = torch.linalg.vector_norm(tr_pred, dim=1).unsqueeze(1)
-        tr_pred = tr_pred / tr_norm * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
+        tr_pred = tr_pred / tr_norm.clamp_min(1e-12) * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
 
         rot_norm = torch.linalg.vector_norm(rot_pred, dim=1).unsqueeze(1)
-        rot_pred = rot_pred / rot_norm * self.rot_final_layer(torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
+        rot_pred = rot_pred / rot_norm.clamp_min(1e-12) * self.rot_final_layer(torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
 
         if self.scale_by_sigma:
             tr_pred = tr_pred / tr_sigma.unsqueeze(1)

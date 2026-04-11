@@ -286,8 +286,13 @@ def low_rank_contact_loss(
     lig_batch = _make_batch_index(data, 'ligand').to(device)                   # [NL]
     # step sizes, make them gentle and scale by current σ_tr if provided
     if tr_sigma is not None:
-        # tr_sigma shape [B,1], map to [B]
-        step_tr = alpha_tr * tr_sigma.squeeze(-1).to(device).clamp_min(1e-3)
+        # Map scalar/[B]/[B,1] sigma inputs to [B]. squeeze(-1) turns a
+        # singleton batch into a 0-d tensor, which breaks per-graph indexing.
+        step_tr = alpha_tr * tr_sigma.to(device).reshape(-1).clamp_min(1e-3)
+        if step_tr.numel() == 1 and B > 1:
+            step_tr = step_tr.expand(B)
+        elif step_tr.numel() != B:
+            raise ValueError(f"tr_sigma must be scalar or have one value per graph; got {step_tr.numel()} values for {B} graphs")
     else:
         step_tr = torch.full((B,), alpha_tr, device=device)
     step_rot = torch.full((B,), alpha_rot, device=device)
