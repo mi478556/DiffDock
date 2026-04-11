@@ -25,10 +25,14 @@ def loss_function(
     apply_mean: bool = True, no_torsion: bool = False,
     # new knobs for the low-rank regularizer:
     rank_weight: float = 0.0,        # set >0 to turn it on
+    rank_mode: str = 'single',
     rank_k: int = 8,
     rank_sigma: float = 2.0,
     rank_alpha_tr: float = 0.25,
     rank_alpha_rot: float = 0.25,
+    rank_ensemble_samples: int = 4,
+    rank_ensemble_tr_std: float = 0.5,
+    rank_ensemble_rot_std: float = 0.15,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
     if isinstance(data, list):
@@ -111,8 +115,10 @@ def loss_function(
         tor_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
         tor_base_loss = torch.zeros(1, dtype=torch.float, device=pred_device) if apply_mean else torch.zeros(len(rot_loss), dtype=torch.float, device=pred_device)
 
-    # stock DiffDock weighted loss
-    loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
+    # Base score-matching loss. For apples-to-apples comparisons with the
+    # original run, train.py passes tr/rot/tor weights as 1.0.
+    score_loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
+    loss = score_loss
 
     rank_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
 
@@ -122,15 +128,19 @@ def loss_function(
             data=data,
             tr_pred=tr_pred.to(pred_device), rot_pred=rot_pred.to(pred_device),
             tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
+            rank_mode=str(rank_mode),
             rank_k=int(rank_k),
             gaussian_sigma=float(rank_sigma),
             alpha_tr=float(rank_alpha_tr),
             alpha_rot=float(rank_alpha_rot),
-            use_receptor_atoms=True
+            use_receptor_atoms=True,
+            ensemble_samples=int(rank_ensemble_samples),
+            ensemble_translation_std=float(rank_ensemble_tr_std),
+            ensemble_rotation_std=float(rank_ensemble_rot_std),
         )
         loss = loss + rank_weight * rank_loss
 
-    return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), rank_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
+    return loss, score_loss.detach(), tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), rank_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
 
 
 class AverageMeter():
@@ -175,12 +185,13 @@ class AverageMeter():
 
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1):
     model.train()
-    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'backbone_loss', 'sidechain_loss',
-                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
+    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
     accum_count = 0
     optimizer.zero_grad()
 
-    for data in tqdm(loader, total=len(loader)):
+    progress = tqdm(loader, total=len(loader))
+    for data in progress:
         # determine if this is a single-example batch (support list or Batch)
         if isinstance(data, list):
             single_batch = len(data) == 1
@@ -210,6 +221,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 names = data.name if device.type == 'cpu' else [d.name for d in data]
                 print("Nan loss, skipping batch with complexes", names)
                 continue
+            score_loss_for_display = loss_tuple[1].detach()
             scaled_loss = loss / grad_accum_steps
             scaled_loss.backward()
             accum_count += 1
@@ -222,6 +234,9 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 accum_count = 0
 
             meter.add([loss.detach().cpu(), *loss_tuple[1:]])
+            if not score_loss_for_display.dim() == 0:
+                score_loss_for_display = score_loss_for_display.mean()
+            progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
             
         except RuntimeError as e:
             if 'out of memory' in str(e):
@@ -260,17 +275,18 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
-    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'backbone_loss', 'sidechain_loss',
-                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
+    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
-            ['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'backbone_loss', 'sidechain_loss',
-             'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
+            ['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+             'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
             unpooled_metrics=True, intervals=10)
 
-    for data in tqdm(loader, total=len(loader)):
+    progress = tqdm(loader, total=len(loader))
+    for data in progress:
         try:
             # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
             if isinstance(data, list):
@@ -282,6 +298,10 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
             if loss_tuple is None: continue
             meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])
+            score_loss_for_display = loss_tuple[1].detach()
+            if not score_loss_for_display.dim() == 0:
+                score_loss_for_display = score_loss_for_display.mean()
+            progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
 
             if test_sigma_intervals > 0:
                 complex_t_tr, complex_t_rot, complex_t_tor = [torch.cat([data[i].complex_t[noise_type] for i in range(len(data))]) for
@@ -290,8 +310,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 sigma_index_rot = torch.round(complex_t_rot.cpu() * (10 - 1)).long()
                 sigma_index_tor = torch.round(complex_t_tor.cpu() * (10 - 1)).long()
                 meter_all.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]],
-                    [sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr, sigma_index_tr,
-                     sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr])
+                    [sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr,
+                     sigma_index_tr, sigma_index_rot, sigma_index_tor])
 
         except RuntimeError as e:
             if 'out of memory' in str(e):

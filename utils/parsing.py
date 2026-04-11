@@ -141,10 +141,14 @@ def parse_train_args():
 
     #low rank
     parser.add_argument("--rank_weight", type=float, default=0.0)
+    parser.add_argument("--rank_mode", type=str, default='single')
     parser.add_argument("--rank_k", type=int, default=8)
     parser.add_argument("--rank_sigma", type=float, default=2.0)
     parser.add_argument("--rank_alpha_tr", type=float, default=0.25)
     parser.add_argument("--rank_alpha_rot", type=float, default=0.25)
+    parser.add_argument("--rank_ensemble_samples", type=int, default=4)
+    parser.add_argument("--rank_ensemble_tr_std", type=float, default=0.5)
+    parser.add_argument("--rank_ensemble_rot_std", type=float, default=0.15)
 
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')
