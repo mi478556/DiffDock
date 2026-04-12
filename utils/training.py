@@ -233,7 +233,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
     accum_count = 0
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     progress = tqdm(loader, total=len(loader))
     for data in progress:
@@ -273,7 +273,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
             if accum_count == grad_accum_steps:
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 if ema_weights is not None:
                     ema_weights.update(model.parameters())
                 accum_count = 0
@@ -290,7 +290,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     if p.grad is not None:
                         del p.grad  # free some memory
                 torch.cuda.empty_cache()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 continue
             elif 'Input mismatch' in str(e):
@@ -299,19 +299,19 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     if p.grad is not None:
                         del p.grad  # free some memory
                 torch.cuda.empty_cache()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 continue
             else:
                 #raise e
                 print(e)
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 continue
 
     if accum_count > 0:
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         if ema_weights is not None:
             ema_weights.update(model.parameters())
             
