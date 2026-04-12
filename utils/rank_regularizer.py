@@ -271,12 +271,14 @@ def low_rank_contact_loss(
     ensemble_samples: int = 4,
     ensemble_translation_std: float = 0.5,
     ensemble_rotation_std: float = 0.15,
+    return_per_graph: bool = False,
 ) -> Tensor:
     """
     Build a smooth ligand–receptor contact matrix from a one-step denoised pose,
     and penalize the Frobenius norm of the residual after best rank-k approximation.
 
-    Returns a scalar tensor.
+    Returns a scalar tensor by default. If return_per_graph=True, returns one
+    loss value per graph so callers can apply per-sample gates before reducing.
     """
     device = tr_pred.device
     B = _num_graphs(data)
@@ -310,12 +312,14 @@ def low_rank_contact_loss(
     single_terms = []
     for M in single_contact_mats:
         if M is None:
+            single_terms.append(lig_pos_hat.new_tensor(0.0))
             continue
         single_terms.append(_tail_energy_from_contact_matrix(M, rank_k=rank_k, normalize=True))
-    single_loss = torch.stack(single_terms).mean() if len(single_terms) > 0 else lig_pos_hat.new_tensor(0.0)
+    single_per_graph = torch.stack(single_terms) if len(single_terms) > 0 else lig_pos_hat.new_zeros((B,))
+    single_loss = single_per_graph.mean()
 
     if rank_mode == 'single':
-        return single_loss
+        return single_per_graph if return_per_graph else single_loss
 
     ensemble_positions = _ensemble_positions_from_base(
         lig_pos_hat,
@@ -340,13 +344,18 @@ def low_rank_contact_loss(
     ensemble_terms = []
     for matrix_list in ensemble_per_graph:
         if len(matrix_list) == 0:
+            ensemble_terms.append(lig_pos_hat.new_tensor(0.0))
             continue
         ensemble_terms.append(stacked_low_rank_tail_energy(matrix_list, rank_k=rank_k, normalize=False))
-    ensemble_loss = torch.stack(ensemble_terms).mean() if len(ensemble_terms) > 0 else lig_pos_hat.new_tensor(0.0)
+    ensemble_per_graph_terms = torch.stack(ensemble_terms) if len(ensemble_terms) > 0 else lig_pos_hat.new_zeros((B,))
+    ensemble_loss = ensemble_per_graph_terms.mean()
 
     if rank_mode == 'ensemble':
-        return ensemble_loss
+        return ensemble_per_graph_terms if return_per_graph else ensemble_loss
     if rank_mode == 'fusion_log1p_sum':
+        fusion_per_graph = torch.log1p(single_per_graph) + torch.log1p(ensemble_per_graph_terms)
+        if return_per_graph:
+            return fusion_per_graph
         return torch.log1p(single_loss) + torch.log1p(ensemble_loss)
 
     raise ValueError(f'Unknown rank_mode: {rank_mode}')

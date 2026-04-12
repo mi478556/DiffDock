@@ -149,6 +149,9 @@ def parse_train_args():
     parser.add_argument("--rank_ensemble_samples", type=int, default=4)
     parser.add_argument("--rank_ensemble_tr_std", type=float, default=0.5)
     parser.add_argument("--rank_ensemble_rot_std", type=float, default=0.15)
+    parser.add_argument("--rank_sigma_gate", action='store_true', default=False)
+    parser.add_argument("--rank_sigma_gate_cutoff", type=float, default=3.0)
+    parser.add_argument("--rank_sigma_gate_temp", type=float, default=0.5)
 
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')

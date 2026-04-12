@@ -33,6 +33,9 @@ def loss_function(
     rank_ensemble_samples: int = 4,
     rank_ensemble_tr_std: float = 0.5,
     rank_ensemble_rot_std: float = 0.15,
+    rank_sigma_gate: bool = False,
+    rank_sigma_gate_cutoff: float = 3.0,
+    rank_sigma_gate_temp: float = 0.5,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
     if isinstance(data, list):
@@ -121,10 +124,11 @@ def loss_function(
     loss = score_loss
 
     rank_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_gate_mean = torch.ones(1, dtype=torch.float, device=pred_device)
 
     # add our low-rank contact loss, computed from a one-step denoised pose
     if rank_weight > 0.0:
-        rank_loss = low_rank_contact_loss(
+        rank_loss_raw = low_rank_contact_loss(
             data=data,
             tr_pred=tr_pred.to(pred_device), rot_pred=rot_pred.to(pred_device),
             tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
@@ -137,10 +141,51 @@ def loss_function(
             ensemble_samples=int(rank_ensemble_samples),
             ensemble_translation_std=float(rank_ensemble_tr_std),
             ensemble_rotation_std=float(rank_ensemble_rot_std),
+            return_per_graph=bool(rank_sigma_gate) or not apply_mean,
         )
+        if rank_sigma_gate or not apply_mean:
+            per_graph_rank_loss = rank_loss_raw.reshape(-1)
+        if rank_sigma_gate:
+            if not isinstance(tr_sigma, torch.Tensor):
+                raise ValueError("rank_sigma_gate=True requires tr_sigma")
+            gate_sigma = tr_sigma.to(pred_device).reshape(-1)
+            if gate_sigma.numel() == 1 and per_graph_rank_loss.numel() > 1:
+                gate_sigma = gate_sigma.expand(per_graph_rank_loss.numel())
+            elif gate_sigma.numel() != per_graph_rank_loss.numel():
+                raise ValueError(
+                    f"rank sigma gate has {gate_sigma.numel()} sigma values for "
+                    f"{per_graph_rank_loss.numel()} rank-loss values"
+                )
+            gate_temp = max(float(rank_sigma_gate_temp), 1e-6)
+            gate = torch.sigmoid((float(rank_sigma_gate_cutoff) - gate_sigma) / gate_temp)
+            gated_rank_loss = gate * per_graph_rank_loss
+            rank_gate_mean = gate.mean() if apply_mean else gate
+            rank_loss = gated_rank_loss.mean() if apply_mean else gated_rank_loss
+        elif not apply_mean:
+            rank_gate_mean = torch.ones_like(per_graph_rank_loss)
+            rank_loss = per_graph_rank_loss
+        else:
+            rank_loss = rank_loss_raw
         loss = loss + rank_weight * rank_loss
 
-    return loss, score_loss.detach(), tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), rank_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
+    if not apply_mean:
+        if rank_loss.numel() == 1 and score_loss.numel() > 1:
+            rank_loss = rank_loss.expand_as(score_loss)
+        if rank_gate_mean.numel() == 1 and score_loss.numel() > 1:
+            rank_gate_mean = rank_gate_mean.expand_as(score_loss)
+
+    return (
+        loss,
+        score_loss.detach(),
+        tr_loss.detach(),
+        rot_loss.detach(),
+        tor_loss.detach(),
+        rank_loss.detach(),
+        rank_gate_mean.detach(),
+        tr_base_loss,
+        rot_base_loss,
+        tor_base_loss,
+    )
 
 
 class AverageMeter():
@@ -185,7 +230,7 @@ class AverageMeter():
 
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1):
     model.train()
-    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
     accum_count = 0
     optimizer.zero_grad()
@@ -275,13 +320,13 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
-    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
-            ['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss',
+            ['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
              'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
             unpooled_metrics=True, intervals=10)
 
@@ -297,6 +342,10 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
             if loss_tuple is None: continue
+            if torch.any(torch.isnan(loss_tuple[0])) or torch.any(torch.isnan(loss_tuple[1])):
+                names = getattr(data, 'name', 'unknown')
+                print("Nan validation loss, skipping batch with complexes", names)
+                continue
             meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])
             score_loss_for_display = loss_tuple[1].detach()
             if not score_loss_for_display.dim() == 0:
@@ -304,13 +353,14 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
 
             if test_sigma_intervals > 0:
-                complex_t_tr, complex_t_rot, complex_t_tor = [torch.cat([data[i].complex_t[noise_type] for i in range(len(data))]) for
-                                                              noise_type in ['tr', 'rot', 'tor']]
+                complex_t_tr = data.complex_t['tr']
+                complex_t_rot = data.complex_t['rot']
+                complex_t_tor = data.complex_t['tor']
                 sigma_index_tr = torch.round(complex_t_tr.cpu() * (10 - 1)).long()
                 sigma_index_rot = torch.round(complex_t_rot.cpu() * (10 - 1)).long()
                 sigma_index_tor = torch.round(complex_t_tor.cpu() * (10 - 1)).long()
                 meter_all.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]],
-                    [sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr,
+                    [sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr,
                      sigma_index_tr, sigma_index_rot, sigma_index_tor])
 
         except RuntimeError as e:

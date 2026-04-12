@@ -52,9 +52,9 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             csv_header = [
                 'epoch',
                 'train_score_loss', 'train_total_loss', 'train_tr_loss', 'train_rot_loss', 'train_tor_loss',
-                'train_rank_loss', 'train_rank_contribution',
+                'train_rank_loss', 'train_rank_contribution', 'train_rank_gate_mean',
                 'val_score_loss', 'val_total_loss', 'val_tr_loss', 'val_rot_loss', 'val_tor_loss',
-                'val_rank_loss', 'val_rank_contribution',
+                'val_rank_loss', 'val_rank_contribution', 'val_rank_gate_mean',
                 'valinf_rmsds_lt2', 'valinf_rmsds_lt5', 'valinf_min_rmsds_lt2', 'valinf_min_rmsds_lt5',
                 'valinf2_rmsds_lt2', 'valinf2_rmsds_lt5', 'valinf2_min_rmsds_lt2', 'valinf2_min_rmsds_lt5',
                 'valinfcomb_rmsds_lt2', 'valinfcomb_rmsds_lt5',
@@ -108,6 +108,9 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_ensemble_samples=args.rank_ensemble_samples,
             rank_ensemble_tr_std=args.rank_ensemble_tr_std,
             rank_ensemble_rot_std=args.rank_ensemble_rot_std,
+            rank_sigma_gate=args.rank_sigma_gate,
+            rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
+            rank_sigma_gate_temp=args.rank_sigma_gate_temp,
         )
         train_losses = train_epoch(
             model,
@@ -119,16 +122,16 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             ema_weights if epoch > freeze_params else None,
             grad_accum_steps=args.grad_accum_steps,
         )
-        print("Epoch {}: Training score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}  lr {:.4f}"
+        print("Epoch {}: Training score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['score_loss'], train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
-                      train_losses['tor_loss'], train_losses['rank_loss'], optimizer.param_groups[0]['lr']))
+                      train_losses['tor_loss'], train_losses['rank_loss'], train_losses.get('rank_gate_mean', 1.0), optimizer.param_groups[0]['lr']))
 
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
         val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
-        print("Epoch {}: Validation score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}"
-              .format(epoch, val_losses['score_loss'], val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['rank_loss']))
+        print("Epoch {}: Validation score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}"
+              .format(epoch, val_losses['score_loss'], val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['rank_loss'], val_losses.get('rank_gate_mean', 1.0)))
         val_selection_loss = val_losses.get('score_loss', val_losses['loss'])
 
         if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
@@ -234,6 +237,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     train_losses.get('tor_loss') if isinstance(train_losses, dict) else None,
                     train_losses.get('rank_loss') if isinstance(train_losses, dict) else None,
                     train_rank_contribution,
+                    train_losses.get('rank_gate_mean') if isinstance(train_losses, dict) else None,
                     val_losses.get('score_loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('tr_loss') if isinstance(val_losses, dict) else None,
@@ -241,6 +245,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     val_losses.get('tor_loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('rank_loss') if isinstance(val_losses, dict) else None,
                     val_rank_contribution,
+                    val_losses.get('rank_gate_mean') if isinstance(val_losses, dict) else None,
                     logs.get('valinf_rmsds_lt2'),
                     logs.get('valinf_rmsds_lt5'),
                     logs.get('valinf_min_rmsds_lt2'),
@@ -278,6 +283,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     if current_lr is not None:
                         tb_writer.add_scalar('train/lr', current_lr, epoch)
                     tb_writer.add_scalar('train/rank_weight', args.rank_weight, epoch)
+                    if isinstance(train_losses, dict) and train_losses.get('rank_gate_mean') is not None:
+                        tb_writer.add_scalar('train/rank_gate_mean', train_losses.get('rank_gate_mean'), epoch)
+                    if isinstance(val_losses, dict) and val_losses.get('rank_gate_mean') is not None:
+                        tb_writer.add_scalar('val/rank_gate_mean', val_losses.get('rank_gate_mean'), epoch)
                     if isinstance(train_losses, dict):
                         for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss']:
                             if train_losses.get(k) is not None:
