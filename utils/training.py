@@ -74,7 +74,7 @@ def loss_function(
         rot_score = torch.cat([d.rot_score for d in data], dim=0).to(pred_device)
     else:
         rot_score = data.rot_score.to(pred_device)
-    rot_score_norm = so3.score_norm(rot_sigma.cpu()).unsqueeze(-1).to(pred_device)
+    rot_score_norm = so3.score_norm(rot_sigma).unsqueeze(-1).to(pred_device)
     rot_loss = (((rot_pred - rot_score) / rot_score_norm) ** 2).mean(dim=mean_dims)
     rot_base_loss = ((rot_score / rot_score_norm) ** 2).mean(dim=mean_dims).detach()
 
@@ -82,18 +82,18 @@ def loss_function(
     if not no_torsion:
         if isinstance(data, list):
             edge_tor_arr = np.concatenate([d.tor_sigma_edge for d in data])
-            edge_tor_sigma = torch.from_numpy(edge_tor_arr)
+            edge_tor_sigma = torch.from_numpy(edge_tor_arr).to(pred_device)
             tor_score = torch.cat([d.tor_score for d in data], dim=0).to(pred_device)
         else:
             # When using a Batched object, some fields (like tor_sigma_edge) may still be lists
             if isinstance(data.tor_sigma_edge, list):
                 edge_tor_arr = np.concatenate(data.tor_sigma_edge)
-                edge_tor_sigma = torch.from_numpy(edge_tor_arr)
+                edge_tor_sigma = torch.from_numpy(edge_tor_arr).to(pred_device)
             else:
-                edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge)
+                edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge).to(pred_device)
             tor_score = data.tor_score.to(pred_device)
 
-        tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float().to(pred_device)
+        tor_score_norm2 = torus.score_norm(edge_tor_sigma).float().to(pred_device)
         tor_loss = ((tor_pred - tor_score) ** 2 / tor_score_norm2)
         tor_base_loss = ((tor_score ** 2 / tor_score_norm2)).detach()
         if apply_mean:
@@ -236,7 +236,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     optimizer.zero_grad(set_to_none=True)
 
     progress = tqdm(loader, total=len(loader))
-    for data in progress:
+    postfix_interval = 10
+    for batch_idx, data in enumerate(progress):
         # determine if this is a single-example batch (support list or Batch)
         if isinstance(data, list):
             single_batch = len(data) == 1
@@ -281,7 +282,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             meter.add([loss.detach().cpu(), *loss_tuple[1:]])
             if not score_loss_for_display.dim() == 0:
                 score_loss_for_display = score_loss_for_display.mean()
-            progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
+            if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
+                progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
             
         except RuntimeError as e:
             if 'out of memory' in str(e):
@@ -331,7 +333,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             unpooled_metrics=True, intervals=10)
 
     progress = tqdm(loader, total=len(loader))
-    for data in progress:
+    postfix_interval = 10
+    for batch_idx, data in enumerate(progress):
         try:
             # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
             if isinstance(data, list):
@@ -350,7 +353,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             score_loss_for_display = loss_tuple[1].detach()
             if not score_loss_for_display.dim() == 0:
                 score_loss_for_display = score_loss_for_display.mean()
-            progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
+            if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
+                progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
 
             if test_sigma_intervals > 0:
                 complex_t_tr = data.complex_t['tr']
