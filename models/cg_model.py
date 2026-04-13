@@ -635,11 +635,13 @@ class CGModel(torch.nn.Module):
 
     def build_center_conv_graph(self, data):
         # builds the filter and edges for the convolution generating translational and rotational scores
-        edge_index = torch.cat([data['ligand'].batch.unsqueeze(0), torch.arange(len(data['ligand'].batch)).to(data['ligand'].x.device).unsqueeze(0)], dim=0)
+        ligand_batch = data['ligand'].batch
+        edge_index = torch.stack(
+            (ligand_batch, torch.arange(ligand_batch.numel(), device=ligand_batch.device)),
+            dim=0,
+        )
 
-        center_pos, count = torch.zeros((data.num_graphs, 3)).to(data['ligand'].x.device), torch.zeros((data.num_graphs, 3)).to(data['ligand'].x.device)
-        center_pos.index_add_(0, index=data['ligand'].batch, source=data['ligand'].pos)
-        center_pos = center_pos / torch.bincount(data['ligand'].batch).unsqueeze(1)
+        center_pos = scatter_mean(data['ligand'].pos, data['ligand'].batch, dim=0, dim_size=data.num_graphs)
 
         edge_vec = data['ligand'].pos[edge_index[1]] - center_pos[edge_index[0]]
         edge_attr = self.center_distance_expansion(edge_vec.norm(dim=-1))

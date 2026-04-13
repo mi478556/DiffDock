@@ -93,7 +93,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                                                                optimizer=optimizer)
 
         logs = {}
-        loss_fn = functools.partial(
+        train_loss_fn = functools.partial(
             loss_function,
             tr_weight=1.0,
             rot_weight=1.0,
@@ -112,13 +112,21 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
             rank_sigma_gate_temp=args.rank_sigma_gate_temp,
         )
+        val_loss_fn = functools.partial(
+            loss_function,
+            tr_weight=1.0,
+            rot_weight=1.0,
+            tor_weight=1.0,
+            no_torsion=args.no_torsion,
+            rank_weight=0.0,
+        )
         train_losses = train_epoch(
             model,
             train_loader,
             optimizer,
             device,
             t_to_sigma,
-            loss_fn,
+            train_loss_fn,
             ema_weights if epoch > freeze_params else None,
             grad_accum_steps=args.grad_accum_steps,
         )
@@ -129,7 +137,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-        val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
+        val_losses = test_epoch(model, val_loader, device, t_to_sigma, val_loss_fn, args.test_sigma_intervals)
         print("Epoch {}: Validation score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}"
               .format(epoch, val_losses['score_loss'], val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['rank_loss'], val_losses.get('rank_gate_mean', 1.0)))
         val_selection_loss = val_losses.get('score_loss', val_losses['loss'])

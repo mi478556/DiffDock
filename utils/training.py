@@ -19,6 +19,16 @@ import torch
 from utils import so3, torus
 from utils.rank_regularizer import low_rank_contact_loss
 
+
+def _bf16_forward_context(device):
+    """Use bf16 for the model forward on CUDA while keeping loss math in fp32."""
+    return torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda')
+
+
+def _as_fp32_prediction(pred):
+    return pred.float() if isinstance(pred, torch.Tensor) else pred
+
+
 def loss_function(
     tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device,
     tr_weight: float = 1.0, rot_weight: float = 1.0, tor_weight: float = 1.0,
@@ -256,8 +266,17 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         # move the whole batch to device (keep as a Batch), so model.forward receives the expected object
         data = data.to(device) if device.type == 'cuda' else data
         try:
-            tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device)
+            with _bf16_forward_context(device):
+                tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+            loss_tuple = loss_fn(
+                _as_fp32_prediction(tr_pred),
+                _as_fp32_prediction(rot_pred),
+                _as_fp32_prediction(tor_pred),
+                sidechain_pred,
+                data=data,
+                t_to_sigma=t_to_sigma,
+                device=device,
+            )
             if loss_tuple is None:
                 print("None loss tuple, skipping")
                 continue
@@ -342,8 +361,18 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             # move the whole batch to device (keep as a Batch), so model.forward receives tensors on the same device
             data = data.to(device) if device.type == 'cuda' else data
             with torch.no_grad():
-                tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
+                with _bf16_forward_context(device):
+                    tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+            loss_tuple = loss_fn(
+                _as_fp32_prediction(tr_pred),
+                _as_fp32_prediction(rot_pred),
+                _as_fp32_prediction(tor_pred),
+                sidechain_pred,
+                data=data,
+                t_to_sigma=t_to_sigma,
+                apply_mean=False,
+                device=device,
+            )
             if loss_tuple is None: continue
             if torch.any(torch.isnan(loss_tuple[0])) or torch.any(torch.isnan(loss_tuple[1])):
                 names = getattr(data, 'name', 'unknown')
