@@ -7,11 +7,29 @@ pdbbind_dir: data/PDBBind_processed/
 split_train: data/PDBBind_processed/splits/timesplit_no_lig_overlap_train
 split_val: data/PDBBind_processed/splits/timesplit_no_lig_overlap_val
 split_test: data/PDBBind_processed/splits/timesplit_test
-batch_size: 16
+batch_size: 12
 n_epochs: 850
 limit_complexes: 0
 use_ema: true
 wandb: false
+# Settings added to match v1.1 score-model preprocessing and architecture
+# These ensure the score model will expect the same receptor features (precomputed ESM)
+# and similar model dimensions as the v1.1 gold-standard model.
+pdbbind_esm_embeddings_path: data/esm2_3billion_embeddings.pt
+cache_path: cache
+all_atoms: false
+remove_hs: true
+receptor_radius: 15.0
+c_alpha_max_neighbors: 24
+ns: 48
+nv: 10
+num_conv_layers: 11
+num_prot_emb_layers: 3
+sigma_embed_dim: 64
+distance_embed_dim: 64
+cross_distance_embed_dim: 64
+atom_max_neighbors: 8
+atom_radius: 5
 # low-rank contact regularizer disabled for full run
 rank_weight: 0.0
 # keep defaults for rank_k and rank_sigma unless you want to change them

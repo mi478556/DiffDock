@@ -2,6 +2,7 @@ import copy
 import numpy as np
 from rdkit.Chem import RemoveAllHs
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch
 from tqdm import tqdm
 import torch
 
@@ -18,16 +19,33 @@ import torch
 from utils import so3, torus
 from utils.rank_regularizer import low_rank_contact_loss
 
+
+def _bf16_forward_context(device):
+    """Use bf16 for the model forward on CUDA while keeping loss math in fp32."""
+    return torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda')
+
+
+def _as_fp32_prediction(pred):
+    return pred.float() if isinstance(pred, torch.Tensor) else pred
+
+
 def loss_function(
     tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device,
     tr_weight: float = 1.0, rot_weight: float = 1.0, tor_weight: float = 1.0,
     apply_mean: bool = True, no_torsion: bool = False,
     # new knobs for the low-rank regularizer:
     rank_weight: float = 0.0,        # set >0 to turn it on
+    rank_mode: str = 'single',
     rank_k: int = 8,
     rank_sigma: float = 2.0,
     rank_alpha_tr: float = 0.25,
     rank_alpha_rot: float = 0.25,
+    rank_ensemble_samples: int = 4,
+    rank_ensemble_tr_std: float = 0.5,
+    rank_ensemble_rot_std: float = 0.15,
+    rank_sigma_gate: bool = False,
+    rank_sigma_gate_cutoff: float = 3.0,
+    rank_sigma_gate_temp: float = 0.5,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
     if isinstance(data, list):
@@ -66,7 +84,7 @@ def loss_function(
         rot_score = torch.cat([d.rot_score for d in data], dim=0).to(pred_device)
     else:
         rot_score = data.rot_score.to(pred_device)
-    rot_score_norm = so3.score_norm(rot_sigma.cpu()).unsqueeze(-1).to(pred_device)
+    rot_score_norm = so3.score_norm(rot_sigma).unsqueeze(-1).to(pred_device)
     rot_loss = (((rot_pred - rot_score) / rot_score_norm) ** 2).mean(dim=mean_dims)
     rot_base_loss = ((rot_score / rot_score_norm) ** 2).mean(dim=mean_dims).detach()
 
@@ -74,13 +92,18 @@ def loss_function(
     if not no_torsion:
         if isinstance(data, list):
             edge_tor_arr = np.concatenate([d.tor_sigma_edge for d in data])
-            edge_tor_sigma = torch.from_numpy(edge_tor_arr)
+            edge_tor_sigma = torch.from_numpy(edge_tor_arr).to(pred_device)
             tor_score = torch.cat([d.tor_score for d in data], dim=0).to(pred_device)
         else:
-            edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge)
+            # When using a Batched object, some fields (like tor_sigma_edge) may still be lists
+            if isinstance(data.tor_sigma_edge, list):
+                edge_tor_arr = np.concatenate(data.tor_sigma_edge)
+                edge_tor_sigma = torch.from_numpy(edge_tor_arr).to(pred_device)
+            else:
+                edge_tor_sigma = torch.from_numpy(data.tor_sigma_edge).to(pred_device)
             tor_score = data.tor_score.to(pred_device)
 
-        tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float().to(pred_device)
+        tor_score_norm2 = torus.score_norm(edge_tor_sigma).float().to(pred_device)
         tor_loss = ((tor_pred - tor_score) ** 2 / tor_score_norm2)
         tor_base_loss = ((tor_score ** 2 / tor_score_norm2)).detach()
         if apply_mean:
@@ -105,24 +128,74 @@ def loss_function(
         tor_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
         tor_base_loss = torch.zeros(1, dtype=torch.float, device=pred_device) if apply_mean else torch.zeros(len(rot_loss), dtype=torch.float, device=pred_device)
 
-    # stock DiffDock weighted loss
-    loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
+    # Base score-matching loss. For apples-to-apples comparisons with the
+    # original run, train.py passes tr/rot/tor weights as 1.0.
+    score_loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight
+    loss = score_loss
+
+    rank_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_gate_mean = torch.ones(1, dtype=torch.float, device=pred_device)
 
     # add our low-rank contact loss, computed from a one-step denoised pose
     if rank_weight > 0.0:
-        lr_loss = low_rank_contact_loss(
+        rank_loss_raw = low_rank_contact_loss(
             data=data,
             tr_pred=tr_pred.to(pred_device), rot_pred=rot_pred.to(pred_device),
             tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
+            rank_mode=str(rank_mode),
             rank_k=int(rank_k),
             gaussian_sigma=float(rank_sigma),
             alpha_tr=float(rank_alpha_tr),
             alpha_rot=float(rank_alpha_rot),
-            use_receptor_atoms=True
+            use_receptor_atoms=True,
+            ensemble_samples=int(rank_ensemble_samples),
+            ensemble_translation_std=float(rank_ensemble_tr_std),
+            ensemble_rotation_std=float(rank_ensemble_rot_std),
+            return_per_graph=bool(rank_sigma_gate) or not apply_mean,
         )
-        loss = loss + rank_weight * lr_loss
+        if rank_sigma_gate or not apply_mean:
+            per_graph_rank_loss = rank_loss_raw.reshape(-1)
+        if rank_sigma_gate:
+            if not isinstance(tr_sigma, torch.Tensor):
+                raise ValueError("rank_sigma_gate=True requires tr_sigma")
+            gate_sigma = tr_sigma.to(pred_device).reshape(-1)
+            if gate_sigma.numel() == 1 and per_graph_rank_loss.numel() > 1:
+                gate_sigma = gate_sigma.expand(per_graph_rank_loss.numel())
+            elif gate_sigma.numel() != per_graph_rank_loss.numel():
+                raise ValueError(
+                    f"rank sigma gate has {gate_sigma.numel()} sigma values for "
+                    f"{per_graph_rank_loss.numel()} rank-loss values"
+                )
+            gate_temp = max(float(rank_sigma_gate_temp), 1e-6)
+            gate = torch.sigmoid((float(rank_sigma_gate_cutoff) - gate_sigma) / gate_temp)
+            gated_rank_loss = gate * per_graph_rank_loss
+            rank_gate_mean = gate.mean() if apply_mean else gate
+            rank_loss = gated_rank_loss.mean() if apply_mean else gated_rank_loss
+        elif not apply_mean:
+            rank_gate_mean = torch.ones_like(per_graph_rank_loss)
+            rank_loss = per_graph_rank_loss
+        else:
+            rank_loss = rank_loss_raw
+        loss = loss + rank_weight * rank_loss
 
-    return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), tr_base_loss, rot_base_loss, tor_base_loss
+    if not apply_mean:
+        if rank_loss.numel() == 1 and score_loss.numel() > 1:
+            rank_loss = rank_loss.expand_as(score_loss)
+        if rank_gate_mean.numel() == 1 and score_loss.numel() > 1:
+            rank_gate_mean = rank_gate_mean.expand_as(score_loss)
+
+    return (
+        loss,
+        score_loss.detach(),
+        tr_loss.detach(),
+        rot_loss.detach(),
+        tor_loss.detach(),
+        rank_loss.detach(),
+        rank_gate_mean.detach(),
+        tr_base_loss,
+        rot_base_loss,
+        tor_base_loss,
+    )
 
 
 class AverageMeter():
@@ -140,37 +213,70 @@ class AverageMeter():
                 self.acc[self.types[type_idx]] += v.sum().cpu() if self.unpooled_metrics else v.cpu()
         else:
             for type_idx, v in enumerate(vals):
-                self.count[type_idx].index_add_(0, interval_idx[type_idx], torch.ones(len(v)))
-                if not torch.allclose(v, torch.tensor(0.0)):
-                    self.acc[self.types[type_idx]].index_add_(0, interval_idx[type_idx], v)
+                # Ensure tensors used for indexing/accumulation are on CPU to avoid device mismatch
+                v_cpu = v.cpu()
+                self.count[type_idx].index_add_(0, interval_idx[type_idx].cpu(), torch.ones(len(v_cpu)))
+                if not torch.allclose(v_cpu, torch.tensor(0.0)):
+                    self.acc[self.types[type_idx]].index_add_(0, interval_idx[type_idx].cpu(), v_cpu)
 
     def summary(self):
         if self.intervals == 1:
+            if self.count == 0:
+                return {k: 0.0 for k in self.types}
             out = {k: v.item() / self.count for k, v in self.acc.items()}
             return out
         else:
             out = {}
             for i in range(self.intervals):
                 for type_idx, k in enumerate(self.types):
-                    out['int' + str(i) + '_' + k] = (
-                            list(self.acc.values())[type_idx][i] / self.count[type_idx][i]).item()
+                    cnt = self.count[type_idx][i]
+                    if cnt == 0:
+                        out['int' + str(i) + '_' + k] = 0.0
+                    else:
+                        out['int' + str(i) + '_' + k] = (
+                            list(self.acc.values())[type_idx][i] / cnt).item()
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1):
     model.train()
-    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
-                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
+    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
+                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
+    accum_count = 0
+    optimizer.zero_grad(set_to_none=True)
 
-    for data in tqdm(loader, total=len(loader)):
-        if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
-            print("Skipping batch of size 1 since otherwise batchnorm would not work.")
-            continue
-        optimizer.zero_grad()
-        data = [d.to(device) for d in data] if device.type == 'cuda' else data
+    progress = tqdm(loader, total=len(loader))
+    postfix_interval = 10
+    for batch_idx, data in enumerate(progress):
+        # determine if this is a single-example batch (support list or Batch)
+        if isinstance(data, list):
+            single_batch = len(data) == 1
+        else:
+            single_batch = getattr(data, 'num_graphs', 1) == 1
+
+        if single_batch:
+            # only skip if the model actually contains BatchNorm modules
+            has_bn = any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in model.modules())
+            if has_bn:
+                print("Skipping batch of size 1 since otherwise batchnorm would not work.")
+                continue
+        # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
+        if isinstance(data, list):
+            data = Batch.from_data_list(data)
+        # move the whole batch to device (keep as a Batch), so model.forward receives the expected object
+        data = data.to(device) if device.type == 'cuda' else data
         try:
-            tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device)
+            with _bf16_forward_context(device):
+                tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+            loss_tuple = loss_fn(
+                _as_fp32_prediction(tr_pred),
+                _as_fp32_prediction(rot_pred),
+                _as_fp32_prediction(tor_pred),
+                sidechain_pred,
+                data=data,
+                t_to_sigma=t_to_sigma,
+                device=device,
+            )
             if loss_tuple is None:
                 print("None loss tuple, skipping")
                 continue
@@ -180,10 +286,23 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 names = data.name if device.type == 'cpu' else [d.name for d in data]
                 print("Nan loss, skipping batch with complexes", names)
                 continue
-            loss.backward()
-            optimizer.step()
-            if ema_weights is not None: ema_weights.update(model.parameters())
-            meter.add([loss.cpu().detach(), *loss_tuple[1:]])
+            score_loss_for_display = loss_tuple[1].detach()
+            scaled_loss = loss / grad_accum_steps
+            scaled_loss.backward()
+            accum_count += 1
+
+            if accum_count == grad_accum_steps:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if ema_weights is not None:
+                    ema_weights.update(model.parameters())
+                accum_count = 0
+
+            meter.add([loss.detach().cpu(), *loss_tuple[1:]])
+            if not score_loss_for_display.dim() == 0:
+                score_loss_for_display = score_loss_for_display.mean()
+            if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
+                progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
             
         except RuntimeError as e:
             if 'out of memory' in str(e):
@@ -192,6 +311,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     if p.grad is not None:
                         del p.grad  # free some memory
                 torch.cuda.empty_cache()
+                optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
                 continue
             elif 'Input mismatch' in str(e):
                 print('| WARNING: weird torch_cluster error, skipping batch')
@@ -199,44 +320,81 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     if p.grad is not None:
                         del p.grad  # free some memory
                 torch.cuda.empty_cache()
+                optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
                 continue
             else:
                 #raise e
                 print(e)
+                optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
                 continue
+
+    if accum_count > 0:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if ema_weights is not None:
+            ema_weights.update(model.parameters())
             
     return meter.summary()
 
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
-    meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
-                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
+    meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
+                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
-            ['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
-             'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
+            ['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
+             'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
             unpooled_metrics=True, intervals=10)
 
-    for data in tqdm(loader, total=len(loader)):
+    progress = tqdm(loader, total=len(loader))
+    postfix_interval = 10
+    for batch_idx, data in enumerate(progress):
         try:
+            # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
+            if isinstance(data, list):
+                data = Batch.from_data_list(data)
+            # move the whole batch to device (keep as a Batch), so model.forward receives tensors on the same device
+            data = data.to(device) if device.type == 'cuda' else data
             with torch.no_grad():
-                tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
+                with _bf16_forward_context(device):
+                    tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+            loss_tuple = loss_fn(
+                _as_fp32_prediction(tr_pred),
+                _as_fp32_prediction(rot_pred),
+                _as_fp32_prediction(tor_pred),
+                sidechain_pred,
+                data=data,
+                t_to_sigma=t_to_sigma,
+                apply_mean=False,
+                device=device,
+            )
             if loss_tuple is None: continue
+            if torch.any(torch.isnan(loss_tuple[0])) or torch.any(torch.isnan(loss_tuple[1])):
+                names = getattr(data, 'name', 'unknown')
+                print("Nan validation loss, skipping batch with complexes", names)
+                continue
             meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])
+            score_loss_for_display = loss_tuple[1].detach()
+            if not score_loss_for_display.dim() == 0:
+                score_loss_for_display = score_loss_for_display.mean()
+            if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
+                progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
 
             if test_sigma_intervals > 0:
-                complex_t_tr, complex_t_rot, complex_t_tor = [torch.cat([data[i].complex_t[noise_type] for i in range(len(data))]) for
-                                                              noise_type in ['tr', 'rot', 'tor']]
+                complex_t_tr = data.complex_t['tr']
+                complex_t_rot = data.complex_t['rot']
+                complex_t_tor = data.complex_t['tor']
                 sigma_index_tr = torch.round(complex_t_tr.cpu() * (10 - 1)).long()
                 sigma_index_rot = torch.round(complex_t_rot.cpu() * (10 - 1)).long()
                 sigma_index_tor = torch.round(complex_t_tor.cpu() * (10 - 1)).long()
                 meter_all.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]],
-                    [sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr,
-                     sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr])
+                    [sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr,
+                     sigma_index_tr, sigma_index_rot, sigma_index_tor])
 
         except RuntimeError as e:
             if 'out of memory' in str(e):

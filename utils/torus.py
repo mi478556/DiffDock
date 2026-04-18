@@ -75,8 +75,31 @@ score_norm_ = score(
 ).reshape(10000, -1)
 score_norm_ = (score_norm_ ** 2).mean(0)
 
+score_norm_torch_cache = {}
+
+
+def _score_norm_torch_table(device):
+    key = str(device)
+    table = score_norm_torch_cache.get(key)
+    if table is None:
+        import torch
+        table = torch.from_numpy(score_norm_).float().to(device)
+        score_norm_torch_cache[key] = table
+    return table
+
 
 def score_norm(sigma):
+    try:
+        import torch
+        if isinstance(sigma, torch.Tensor):
+            table = _score_norm_torch_table(sigma.device)
+            sigma_idx = torch.log(sigma / np.pi)
+            sigma_idx = (sigma_idx - np.log(SIGMA_MIN)) / (np.log(SIGMA_MAX) - np.log(SIGMA_MIN)) * SIGMA_N
+            sigma_idx = torch.clamp(torch.round(sigma_idx).long(), min=0, max=SIGMA_N)
+            return table[sigma_idx]
+    except Exception:
+        pass
+
     sigma = np.log(sigma / np.pi)
     sigma = (sigma - np.log(SIGMA_MIN)) / (np.log(SIGMA_MAX) - np.log(SIGMA_MIN)) * SIGMA_N
     sigma = np.round(np.clip(sigma, 0, SIGMA_N)).astype(int)

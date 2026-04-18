@@ -341,6 +341,7 @@ class OldTensorProductConvLayer(torch.nn.Module):
         super(OldTensorProductConvLayer, self).__init__()
         self.in_irreps = in_irreps
         self.out_irreps = out_irreps
+        self.out_size = o3.Irreps(out_irreps).dim
         self.sh_irreps = sh_irreps
         self.residual = residual
         if hidden_features is None:
@@ -357,12 +358,17 @@ class OldTensorProductConvLayer(torch.nn.Module):
         self.batch_norm = BatchNorm(out_irreps) if batch_norm else None
 
     def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', edge_weight=1.0):
+        if edge_index.shape[1] == 0 and node_attr.shape[0] == 0:
+            raise ValueError("No edges and no nodes")
+        if edge_index.shape[1] == 0:
+            out_n = out_nodes if out_nodes is not None else node_attr.shape[0]
+            return torch.zeros((out_n, self.out_size), dtype=node_attr.dtype, device=node_attr.device)
 
         # Break up the edge_attr into chunks to limit the maximum memory usage
         edge_chunk_size = 100_000
         num_edges = edge_attr.shape[0]
-        num_chunks = (num_edges // edge_chunk_size) if num_edges % edge_chunk_size == 0 \
-            else (num_edges // edge_chunk_size) + 1
+        num_chunks = max(1, (num_edges // edge_chunk_size) if num_edges % edge_chunk_size == 0
+                         else (num_edges // edge_chunk_size) + 1)
         edge_ranges = np.array_split(np.arange(num_edges), num_chunks)
         edge_attr_groups = [edge_attr[cur_range] for cur_range in edge_ranges]
 

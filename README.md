@@ -191,6 +191,39 @@ Then run the command:
 
     python datasets/esm_embeddings_to_pt.py
 
+    ### Exact ESM extraction command used
+
+    The following is the exact command that was used to generate the ESM2 embeddings for the BindingMOAD dataset. Use this exact command and flags (only replace the input FASTA path and the output directory for other datasets).
+
+    ```
+    python scripts/extract.py esm2_t36_3B_UR50D \
+        data/BindingMOAD_2020_ab_processed_biounit/sequences_to_id.fasta \
+        data/moad_embeddings_output \
+        --repr_layers 36 --include per_tok --truncation_seq_length 4096
+    ```
+
+    Examples for the other datasets (replace paths accordingly, keep flags and model the same):
+
+    - PDBBind:
+
+    ```
+    python scripts/extract.py esm2_t36_3B_UR50D \
+        data/PDBBind_processed/sequences_to_id.fasta \
+        data/pdbbind_embeddings_output \
+        --repr_layers 36 --include per_tok --truncation_seq_length 4096
+    ```
+
+    - PDB sidechain dataset:
+
+    ```
+    python scripts/extract.py esm2_t36_3B_UR50D \
+        data/pdb_2021aug02/sequences_to_id.fasta \
+        data/pdbsidechain_embeddings_output \
+        --repr_layers 36 --include per_tok --truncation_seq_length 4096
+    ```
+
+    After running the extractor, aggregate the per-sequence `.pt` outputs as described above (run `python datasets/esm_embeddings_to_pt.py`).
+
 ### Run DiffDock-L
 
 For PDBBind: 

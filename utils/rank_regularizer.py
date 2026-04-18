@@ -2,7 +2,7 @@
 # Low-rank contact regularizer for DiffDock training.
 # Works with both DataParallel (CUDA) list batches and single PyG Batch on CPU.
 
-from typing import Optional, Tuple
+from typing import Optional
 import torch
 from torch import Tensor
 from torch_scatter import scatter_max, scatter_mean
@@ -116,22 +116,169 @@ def _frobenius_tail_energy_from_svals(svals: Tensor, k: int) -> Tensor:
     tail = svals[k:]
     return torch.sum(tail * tail)
 
+
+def _tail_energy_from_contact_matrix(M: Tensor, rank_k: int, normalize: bool = True) -> Tensor:
+    svals = torch.linalg.svdvals(M)
+    tail_energy = _frobenius_tail_energy_from_svals(svals, rank_k)
+    if normalize:
+        return tail_energy / M.numel()
+    return tail_energy
+
+
+def _smooth_contact_matrix_from_distances(distances: Tensor, gaussian_sigma: float = 2.0) -> Tensor:
+    sigma2 = float(gaussian_sigma) ** 2
+    return torch.exp(-(distances * distances) / sigma2).clamp_min(1e-6)
+
+
+def _soft_clash_penalty_from_distances(
+    distances: Tensor,
+    clash_cutoff: float = 2.0,
+    clash_power: float = 2.0,
+) -> Tensor:
+    """
+    Smooth penalty for overly short ligand-receptor distances.
+    Returns the mean positive shortfall below clash_cutoff raised to clash_power.
+    """
+    shortfall = torch.clamp(float(clash_cutoff) - distances, min=0.0)
+    if shortfall.numel() == 0:
+        return distances.new_tensor(0.0)
+    return torch.mean(shortfall ** float(clash_power))
+
+
+def stacked_low_rank_tail_energy(
+    matrix_list,
+    rank_k: int = 8,
+    normalize: bool = True,
+) -> Tensor:
+    """
+    Computes low-rank tail energy over a stack of flattened matrices.
+    Useful for trajectory- and ensemble-level probes or losses.
+    """
+    if len(matrix_list) == 0:
+        return torch.tensor(0.0)
+    finite_mats = [m for m in matrix_list if torch.isfinite(m).all()]
+    if len(finite_mats) == 0:
+        return matrix_list[0].new_tensor(float('nan'))
+    stacked = torch.stack([m.reshape(-1) for m in finite_mats], dim=0)
+    svals = torch.linalg.svdvals(stacked)
+    tail_energy = _frobenius_tail_energy_from_svals(svals, rank_k)
+    if normalize:
+        return tail_energy / stacked.numel()
+    return tail_energy
+
+
+def _ensemble_positions_from_base(
+    base_lig_pos: Tensor,
+    lig_batch: Tensor,
+    num_graphs: int,
+    ensemble_samples: int,
+    translation_std: float,
+    rotation_std: float,
+) -> list:
+    out = []
+    for _ in range(int(ensemble_samples)):
+        tr_noise = torch.normal(
+            mean=0.0,
+            std=float(translation_std),
+            size=(num_graphs, 3),
+            device=base_lig_pos.device,
+            dtype=base_lig_pos.dtype,
+        )
+        rot_noise = torch.normal(
+            mean=0.0,
+            std=float(rotation_std),
+            size=(num_graphs, 3),
+            device=base_lig_pos.device,
+            dtype=base_lig_pos.dtype,
+        )
+        step_tr = torch.ones(num_graphs, device=base_lig_pos.device, dtype=base_lig_pos.dtype)
+        step_rot = torch.ones(num_graphs, device=base_lig_pos.device, dtype=base_lig_pos.dtype)
+        out.append(_apply_one_step_se3(base_lig_pos, lig_batch, tr_noise, rot_noise, step_tr, step_rot))
+    return out
+
+
+def _build_contact_matrices_from_ligand_positions(
+    data,
+    lig_pos: Tensor,
+    gaussian_sigma: float = 2.0,
+    use_receptor_atoms: bool = True,
+):
+    device = lig_pos.device
+    lig_batch = _make_batch_index(data, 'ligand').to(device)
+    lig_x = _stack_graph_field(data, 'ligand', 'x').to(device)
+    lig_mask_heavy = _heavy_atom_mask(lig_x)
+
+    try:
+        rec_key = 'atom' if use_receptor_atoms else 'receptor'
+        rec_pos = _stack_graph_field(data, rec_key, 'pos').to(device)
+        rec_batch = _make_batch_index(data, rec_key).to(device)
+    except Exception:
+        rec_pos = _stack_graph_field(data, 'receptor', 'pos').to(device)
+        rec_batch = _make_batch_index(data, 'receptor').to(device)
+
+    out = []
+    for b in range(_num_graphs(data)):
+        lmask = lig_batch == b
+        rmask = rec_batch == b
+        L = lig_pos[lmask & lig_mask_heavy]
+        R = rec_pos[rmask]
+        if L.size(0) == 0 or R.size(0) == 0:
+            out.append(None)
+            continue
+        D = torch.cdist(L, R, compute_mode='donot_use_mm_for_euclid_dist')
+        out.append(_smooth_contact_matrix_from_distances(D, gaussian_sigma=gaussian_sigma))
+    return out
+
+
+def stacked_soft_clash_penalty(
+    distance_list,
+    clash_cutoff: float = 2.0,
+    clash_power: float = 2.0,
+    normalize_over_matrices: bool = True,
+) -> Tensor:
+    """
+    Aggregates a soft clash penalty across an ensemble/trajectory of distance matrices.
+    """
+    if len(distance_list) == 0:
+        return torch.tensor(0.0)
+    penalties = []
+    for distances in distance_list:
+        if distances is None or not torch.isfinite(distances).all():
+            continue
+        penalties.append(_soft_clash_penalty_from_distances(
+            distances,
+            clash_cutoff=clash_cutoff,
+            clash_power=clash_power,
+        ))
+    if len(penalties) == 0:
+        return distance_list[0].new_tensor(float('nan'))
+    stacked_penalties = torch.stack(penalties)
+    if normalize_over_matrices:
+        return torch.mean(stacked_penalties)
+    return torch.sum(stacked_penalties)
+
 def low_rank_contact_loss(
     data,
     tr_pred: Tensor,                 # [B,3]
     rot_pred: Tensor,                # [B,3]
     tr_sigma: Optional[Tensor] = None,   # [B,1] from loss_function
+    rank_mode: str = 'single',
     rank_k: int = 8,
     gaussian_sigma: float = 2.0,
     alpha_tr: float = 0.25,
     alpha_rot: float = 0.25,
-    use_receptor_atoms: bool = True
+    use_receptor_atoms: bool = True,
+    ensemble_samples: int = 4,
+    ensemble_translation_std: float = 0.5,
+    ensemble_rotation_std: float = 0.15,
+    return_per_graph: bool = False,
 ) -> Tensor:
     """
     Build a smooth ligand–receptor contact matrix from a one-step denoised pose,
     and penalize the Frobenius norm of the residual after best rank-k approximation.
 
-    Returns a scalar tensor.
+    Returns a scalar tensor by default. If return_per_graph=True, returns one
+    loss value per graph so callers can apply per-sample gates before reducing.
     """
     device = tr_pred.device
     B = _num_graphs(data)
@@ -139,21 +286,15 @@ def low_rank_contact_loss(
     # ensure graph tensors live on the same device as model predictions
     lig_pos_t = _stack_graph_field(data, 'ligand', 'pos').to(device)           # [NL,3]
     lig_batch = _make_batch_index(data, 'ligand').to(device)                   # [NL]
-    lig_x = _stack_graph_field(data, 'ligand', 'x').to(device)                 # categorical features
-    lig_mask_heavy = _heavy_atom_mask(lig_x)
-
-    # receptor positions: prefer atom graph if present
-    try:
-        rec_pos = _stack_graph_field(data, 'atom' if use_receptor_atoms else 'receptor', 'pos').to(device)
-        rec_batch = _make_batch_index(data, 'atom' if use_receptor_atoms else 'receptor').to(device)
-    except Exception:
-        rec_pos = _stack_graph_field(data, 'receptor', 'pos').to(device)
-        rec_batch = _make_batch_index(data, 'receptor').to(device)
-
     # step sizes, make them gentle and scale by current σ_tr if provided
     if tr_sigma is not None:
-        # tr_sigma shape [B,1], map to [B]
-        step_tr = alpha_tr * tr_sigma.squeeze(-1).to(device).clamp_min(1e-3)
+        # Map scalar/[B]/[B,1] sigma inputs to [B]. squeeze(-1) turns a
+        # singleton batch into a 0-d tensor, which breaks per-graph indexing.
+        step_tr = alpha_tr * tr_sigma.to(device).reshape(-1).clamp_min(1e-3)
+        if step_tr.numel() == 1 and B > 1:
+            step_tr = step_tr.expand(B)
+        elif step_tr.numel() != B:
+            raise ValueError(f"tr_sigma must be scalar or have one value per graph; got {step_tr.numel()} values for {B} graphs")
     else:
         step_tr = torch.full((B,), alpha_tr, device=device)
     step_rot = torch.full((B,), alpha_rot, device=device)
@@ -161,35 +302,63 @@ def low_rank_contact_loss(
     # one tiny reverse SE3 step to get a denoised pose that depends on params
     lig_pos_hat = _apply_one_step_se3(lig_pos_t, lig_batch, tr_pred, rot_pred, step_tr, step_rot)
 
-    # per-graph contact low-rank penalty
-    sigma2 = float(gaussian_sigma) ** 2
-    total = lig_pos_hat.new_tensor(0.0)
-    norm = 0.0
+    single_contact_mats = _build_contact_matrices_from_ligand_positions(
+        data,
+        lig_pos_hat,
+        gaussian_sigma=gaussian_sigma,
+        use_receptor_atoms=use_receptor_atoms,
+    )
 
-    for b in range(B):
-        lmask = lig_batch == b
-        rmask = rec_batch == b
-        if not lmask.any() or not rmask.any():
+    single_terms = []
+    for M in single_contact_mats:
+        if M is None:
+            single_terms.append(lig_pos_hat.new_tensor(0.0))
             continue
-        L = lig_pos_hat[lmask & lig_mask_heavy]    # heavy ligand atoms [nL,3]
-        R = rec_pos[rmask]                         # receptor atoms or residues [nR,3]
-        if L.size(0) == 0 or R.size(0) == 0:
+        single_terms.append(_tail_energy_from_contact_matrix(M, rank_k=rank_k, normalize=True))
+    single_per_graph = torch.stack(single_terms) if len(single_terms) > 0 else lig_pos_hat.new_zeros((B,))
+    single_loss = single_per_graph.mean()
+
+    if rank_mode == 'single':
+        return single_per_graph if return_per_graph else single_loss
+
+    ensemble_positions = _ensemble_positions_from_base(
+        lig_pos_hat,
+        lig_batch,
+        B,
+        ensemble_samples=ensemble_samples,
+        translation_std=ensemble_translation_std,
+        rotation_std=ensemble_rotation_std,
+    )
+    ensemble_per_graph = [[] for _ in range(B)]
+    for sample_pos in ensemble_positions:
+        sample_contact_mats = _build_contact_matrices_from_ligand_positions(
+            data,
+            sample_pos,
+            gaussian_sigma=gaussian_sigma,
+            use_receptor_atoms=use_receptor_atoms,
+        )
+        for graph_idx, M in enumerate(sample_contact_mats):
+            if M is not None:
+                ensemble_per_graph[graph_idx].append(M)
+
+    ensemble_terms = []
+    for matrix_list in ensemble_per_graph:
+        if len(matrix_list) == 0:
+            ensemble_terms.append(lig_pos_hat.new_tensor(0.0))
             continue
+        ensemble_terms.append(stacked_low_rank_tail_energy(matrix_list, rank_k=rank_k, normalize=False))
+    ensemble_per_graph_terms = torch.stack(ensemble_terms) if len(ensemble_terms) > 0 else lig_pos_hat.new_zeros((B,))
+    ensemble_loss = ensemble_per_graph_terms.mean()
 
-        # pairwise distances and Gaussian contact kernel
-        D = torch.cdist(L, R, compute_mode='donot_use_mm_for_euclid_dist')  # [nL,nR]
-        M = torch.exp(-(D * D) / sigma2).clamp_min(1e-6)                    # positive smooth contacts
+    if rank_mode == 'ensemble':
+        return ensemble_per_graph_terms if return_per_graph else ensemble_loss
+    if rank_mode == 'fusion_log1p_sum':
+        fusion_per_graph = torch.log1p(single_per_graph) + torch.log1p(ensemble_per_graph_terms)
+        if return_per_graph:
+            return fusion_per_graph
+        return torch.log1p(single_loss) + torch.log1p(ensemble_loss)
 
-        # low-rank residual via singular values tail energy
-        s = torch.linalg.svdvals(M)     # descending
-        tail_energy = _frobenius_tail_energy_from_svals(s, rank_k)  # scalar
-        total = total + tail_energy / M.numel()
-        norm += 1.0
-
-    if norm == 0.0:
-        return total  # zero
-
-    return total / norm
+    raise ValueError(f'Unknown rank_mode: {rank_mode}')
 
 
 # utils/rank_regularizer.py  — inference guidance helpers

@@ -5,7 +5,7 @@
 torch==1.13.1+cu117
 dllogger@git+https://github.com/NVIDIA/dllogger.git
 e3nn==0.5.0
-fair-esm[esmfold]==2.0.0
+fair-esm[esmfold]==2.0.1
 networkx==2.8.4
 openfold@git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307
 pandas==1.5.1

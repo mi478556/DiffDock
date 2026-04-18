@@ -70,8 +70,20 @@ def modify_conformer_batch(orig_pos, data, tr_update, rot_update, torsion_update
 
     if torsion_updates is not None:
         flexible_new_pos = modify_conformer_torsion_angles_batch(rigid_new_pos, edge_index.T[edge_mask], mask_rotate, torsion_updates)
-        R, t = rigid_transform_Kabsch_3D_torch_batch(flexible_new_pos, rigid_new_pos)
-        aligned_flexible_pos = torch.bmm(flexible_new_pos, R.transpose(1, 2)) + t.transpose(1, 2)
+        # Guard Kabsch against non-finite samples; keep rigid update for invalid items.
+        rigid_safe = torch.nan_to_num(rigid_new_pos, nan=0.0, posinf=0.0, neginf=0.0)
+        flexible_safe = torch.nan_to_num(flexible_new_pos, nan=0.0, posinf=0.0, neginf=0.0)
+        valid = torch.isfinite(rigid_new_pos).reshape(B, -1).all(dim=1) & torch.isfinite(flexible_new_pos).reshape(B, -1).all(dim=1)
+
+        aligned_flexible_pos = rigid_safe.clone()
+        if bool(valid.any()):
+            try:
+                R, t = rigid_transform_Kabsch_3D_torch_batch(flexible_safe[valid], rigid_safe[valid])
+                aligned_valid = torch.bmm(flexible_safe[valid], R.transpose(1, 2)) + t.transpose(1, 2)
+                aligned_flexible_pos[valid] = aligned_valid
+            except RuntimeError:
+                # Fall back to rigid update for this step when SVD is unstable.
+                pass
         final_pos = aligned_flexible_pos.reshape(-1, 3)
     else:
         final_pos = rigid_new_pos.reshape(-1, 3)

@@ -52,6 +52,7 @@ def parse_train_args():
     parser.add_argument('--num_workers', type=int, default=1, help='Number of workers for preprocessing')
     parser.add_argument('--use_ema', action='store_true', default=False, help='Whether or not to use ema for the model weights')
     parser.add_argument('--ema_rate', type=float, default=0.999, help='decay rate for the exponential moving average model parameters ')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of micro-batches to accumulate before optimizer step')
     parser.add_argument('--enable_logging', action='store_true', default=False, help='Enable per-epoch CSV and TensorBoard logging into the run_dir')
 
     # Dataset
@@ -78,6 +79,7 @@ def parse_train_args():
     parser.add_argument('--train_multiplicity', type=int, default=1, help='')
     parser.add_argument('--val_multiplicity', type=int, default=1, help='')
     parser.add_argument('--max_receptor_size', type=int, default=None, help='')
+    parser.add_argument('--nan_fraction_threshold', type=float, default=0.6, help='Max allowed fraction of NaNs in coords before skipping')
     parser.add_argument('--remove_promiscuous_targets', type=int, default=None, help='')
     parser.add_argument('--min_ligand_size', type=int, default=0, help='')
     parser.add_argument('--unroll_clusters', action='store_true', default=False, help='')
@@ -139,10 +141,17 @@ def parse_train_args():
 
     #low rank
     parser.add_argument("--rank_weight", type=float, default=0.0)
+    parser.add_argument("--rank_mode", type=str, default='single')
     parser.add_argument("--rank_k", type=int, default=8)
     parser.add_argument("--rank_sigma", type=float, default=2.0)
     parser.add_argument("--rank_alpha_tr", type=float, default=0.25)
     parser.add_argument("--rank_alpha_rot", type=float, default=0.25)
+    parser.add_argument("--rank_ensemble_samples", type=int, default=4)
+    parser.add_argument("--rank_ensemble_tr_std", type=float, default=0.5)
+    parser.add_argument("--rank_ensemble_rot_std", type=float, default=0.15)
+    parser.add_argument("--rank_sigma_gate", action='store_true', default=False)
+    parser.add_argument("--rank_sigma_gate_cutoff", type=float, default=3.0)
+    parser.add_argument("--rank_sigma_gate_temp", type=float, default=0.5)
 
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')
@@ -152,9 +161,11 @@ def parse_train_args():
     parser.add_argument('--vandermers_buffer_residue_num', type=int, default=7, help='')
     parser.add_argument('--vandermers_min_contacts', type=int, default=None, help='')
     parser.add_argument('--remove_second_segment', action='store_true', default=False, help='')
+    parser.add_argument('--load_timeout', type=int, default=600, help='Timeout (s) for loading a single protein during preprocessing')
 
     args = parser.parse_args()
 
+    assert args.grad_accum_steps >= 1
     assert (not args.dynamic_max_cross) or (args.tr_sigma_max * 3 + 20 < args.cross_max_distance)
     assert args.esm_embeddings_model is None or args.esm_embeddings_path is None
     return args

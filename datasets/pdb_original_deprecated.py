@@ -5,6 +5,8 @@ import os.path
 import pickle
 import random
 from multiprocessing import Pool
+import multiprocessing as mp
+import time
 
 import numpy as np
 import pandas as pd
@@ -147,6 +149,17 @@ def compute_cg_features(aa, aa_smile):
     return complex_graph
 
 
+def _load_chain_process(obj, c, q):
+    try:
+        res = obj.load_chain(c)
+    except Exception:
+        res = None
+    try:
+        q.put((c, res))
+    except Exception:
+        pass
+
+
 class PDBSidechain(Dataset):
     def __init__(self, root, transform=None, cache_path='data/cache', split='train', limit_complexes=0,
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, remove_hs=True, all_atoms=False,
@@ -230,6 +243,9 @@ class PDBSidechain(Dataset):
     def define_probabilities(self):
         if not self.vandermers_extraction:
             return
+
+
+        # per-chain loader runs use module-level _load_chain_process
 
         if self.vandermers_min_contacts is not None:
             self.probabilities = torch.arange(1000) - self.vandermers_min_contacts + 1
@@ -464,17 +480,72 @@ class PDBSidechain(Dataset):
                 continue
             chains_names = self.chains_in_cluster[10000 * i:10000 * (i + 1)]
             protein_graphs = []
-            if self.num_workers > 1:
-                p = Pool(self.num_workers, maxtasksperchild=1)
-                p.__enter__()
-            with tqdm(total=len(chains_names),
-                      desc=f'loading protein batch {i}/{len(self.chains_in_cluster) // 10000 + 1}') as pbar:
-                map_fn = p.imap_unordered if self.num_workers > 1 else map
-                for t in map_fn(self.load_chain, chains_names):
-                    if t is not None:
-                        protein_graphs.append(t)
+
+            # Use per-chain processes with timeout to avoid hanging on a single item.
+            q = mp.Queue()
+            active = {}
+            start_times = {}
+
+            with tqdm(total=len(chains_names), desc=f'loading protein batch {i}/{len(self.chains_in_cluster) // 10000 + 1}') as pbar:
+                for c in chains_names:
+                    # start process for this chain
+                    p = mp.Process(target=_load_chain_process, args=(self, c, q))
+                    p.start()
+                    active[c] = p
+                    start_times[c] = time.time()
+
+                    # If we've reached max workers, wait for at least one to finish or timeout
+                    while len(active) >= max(1, self.num_workers):
+                        try:
+                            c_done, res = q.get(timeout=1)
+                        except Exception:
+                            # check for per-process timeout (10s)
+                            now = time.time()
+                            to_kill = [k for k, t0 in start_times.items() if now - t0 > 10 and active.get(k) is not None and active[k].is_alive()]
+                            for k in to_kill:
+                                try:
+                                    active[k].terminate()
+                                    active[k].join(timeout=1)
+                                except Exception:
+                                    pass
+                                start_times.pop(k, None)
+                                active.pop(k, None)
+                                pbar.update()
+                            continue
+                        # collect finished
+                        proc = active.pop(c_done, None)
+                        start_times.pop(c_done, None)
+                        if proc is not None:
+                            proc.join(timeout=1)
+                        if res is not None:
+                            protein_graphs.append(res)
+                        pbar.update()
+
+                # drain remaining active processes
+                while active:
+                    try:
+                        c_done, res = q.get(timeout=1)
+                    except Exception:
+                        # terminate any that exceeded timeout
+                        now = time.time()
+                        to_kill = [k for k, t0 in start_times.items() if now - t0 > 10 and active.get(k) is not None and active[k].is_alive()]
+                        for k in to_kill:
+                            try:
+                                active[k].terminate()
+                                active[k].join(timeout=1)
+                            except Exception:
+                                pass
+                            start_times.pop(k, None)
+                            active.pop(k, None)
+                            pbar.update()
+                        continue
+                    proc = active.pop(c_done, None)
+                    start_times.pop(c_done, None)
+                    if proc is not None:
+                        proc.join(timeout=1)
+                    if res is not None:
+                        protein_graphs.append(res)
                     pbar.update()
-            if self.num_workers > 1: p.__exit__(None, None, None)
 
             with open(os.path.join(self.cache_path, f"protein_graphs{i}.pkl"), 'wb') as f:
                 pickle.dump(protein_graphs, f)

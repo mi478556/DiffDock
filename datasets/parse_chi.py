@@ -88,13 +88,50 @@ def get_dihedral_indices(onehot_sequence):
 
 def _get_chi_angles(coords, indices):
     X = coords
-    Y = indices.astype(int)
     N = coords.shape[0]
+
+    # indices may contain NaN; build an integer index array safely
     mask = np.isnan(indices)
-    Y[mask] = 0
-    Z = X[np.arange(N)[:, None, None], Y, :]
+    Y = np.zeros_like(indices, dtype=int)
+
+    # Safely cast only the non-NaN entries to int
+    try:
+        valid = ~mask
+        if valid.any():
+            Y[valid] = indices[valid].astype(int)
+    except Exception:
+        # Fallback: iterate and cast, marking invalid entries
+        for i in range(indices.shape[0]):
+            for j in range(indices.shape[1]):
+                if not mask[i, j]:
+                    try:
+                        Y[i, j] = int(indices[i, j])
+                    except Exception:
+                        mask[i, j] = True
+                        Y[i, j] = 0
+
+    # Clip out-of-range indices to a safe value (0). We'll re-mask them afterwards.
+    max_idx = X.shape[1] - 1
+    oob = (Y < 0) | (Y > max_idx)
+    if oob.any():
+        mask[oob] = True
+        Y[oob] = 0
+
+    # Gather coordinates for the requested atom positions; shape will be (N, 4, 3)
+    try:
+        Z = X[np.arange(N)[:, None, None], Y, :]
+    except Exception:
+        # If indexing fails for any reason, return all-NaN chi angles for safety
+        return np.full((N, 4), np.nan)
+
+    # Restore NaNs where indices were invalid or missing
     Z[mask] = np.nan
-    chi_angles = batch_compute_dihedral_angles(Z.reshape(-1, 4, 3)).reshape(N, 4)
+
+    # Compute dihedral angles, guarding against errors during calculation
+    try:
+        chi_angles = batch_compute_dihedral_angles(Z.reshape(-1, 4, 3)).reshape(N, 4)
+    except Exception:
+        chi_angles = np.full((N, 4), np.nan)
     return chi_angles
 
 

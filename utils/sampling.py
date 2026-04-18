@@ -14,6 +14,16 @@ from utils.logging_utils import get_logger
 from utils.rank_regularizer import low_rank_guidance_step_inplace
 
 
+def _finite_replacement_value(tensor, scale=0.01, fallback=1e-3):
+    finite = tensor[torch.isfinite(tensor)]
+    if finite.numel() == 0:
+        return torch.tensor(fallback, device=tensor.device, dtype=tensor.dtype)
+    eps = scale * finite.abs().mean()
+    if not torch.isfinite(eps) or eps <= 0:
+        return torch.tensor(fallback, device=tensor.device, dtype=tensor.dtype)
+    return eps
+
+
 def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, pocket_knowledge=False, pocket_cutoff=7,
                        initial_noise_std_proportion=-1.0, choose_residue=False):
     # in place modification of the list
@@ -112,8 +122,11 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 if hasattr(model_args, 'crop_beyond') and model_args.crop_beyond is not None:
                     #print('Cropping beyond', tr_sigma * 3 + model_args.crop_beyond, 'for score model')
                     mod_complex_graph_batch = copy.deepcopy(complex_graph_batch).to_data_list()
+                    cutoff = tr_sigma * 3 + model_args.crop_beyond
                     for batch in mod_complex_graph_batch:
-                        crop_beyond(batch, tr_sigma * 3 + model_args.crop_beyond, model_args.all_atoms)
+                        d2 = torch.sum((batch['ligand'].pos.unsqueeze(0) - batch['receptor'].pos.unsqueeze(1)) ** 2, -1)
+                        if torch.any(torch.any(d2 < cutoff ** 2, dim=1)):
+                            crop_beyond(batch, cutoff, model_args.all_atoms)
                     mod_complex_graph_batch = Batch.from_data_list(mod_complex_graph_batch)
                 else:
                     mod_complex_graph_batch = complex_graph_batch
@@ -131,12 +144,20 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                     logger.warning(f"Complex {name} Batch {batch_id+1} Inference Iteration {t_idx}: "
                                    f"{num_nans} / {mean_scores.numel()} samples failed")
 
-                    # Set the nan values to a small value, just want to disturb slightly
-                    # Hopefully won't get nan the next iteration
-                    tr_score.nan_to_num_(nan=(eps := 0.01*torch.nanmean(tr_score.abs())), posinf=eps, neginf=-eps)
-                    rot_score.nan_to_num_(nan=(eps := 0.01*torch.nanmean(rot_score.abs())), posinf=eps, neginf=-eps)
-                    tor_score.nan_to_num_(nan=(eps := 0.01*torch.nanmean(tor_score.abs())), posinf=eps, neginf=-eps)
-                    del eps
+                    # Use finite-only scale; if all values are non-finite, fall back to a small constant.
+                    tr_eps = _finite_replacement_value(tr_score)
+                    rot_eps = _finite_replacement_value(rot_score)
+                    tor_eps = _finite_replacement_value(tor_score)
+                    tr_score.nan_to_num_(nan=tr_eps, posinf=tr_eps, neginf=-tr_eps)
+                    rot_score.nan_to_num_(nan=rot_eps, posinf=rot_eps, neginf=-rot_eps)
+                    tor_score.nan_to_num_(nan=tor_eps, posinf=tor_eps, neginf=-tor_eps)
+                    # Final safety net: if anything non-finite remains, zero it.
+                    if not torch.isfinite(tr_score).all():
+                        tr_score = torch.where(torch.isfinite(tr_score), tr_score, torch.zeros_like(tr_score))
+                    if not torch.isfinite(rot_score).all():
+                        rot_score = torch.where(torch.isfinite(rot_score), rot_score, torch.zeros_like(rot_score))
+                    if not torch.isfinite(tor_score).all():
+                        tor_score = torch.where(torch.isfinite(tor_score), tor_score, torch.zeros_like(tor_score))
 
                 tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tr_sigma_max / model_args.tr_sigma_min)))
                 rot_g = rot_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.rot_sigma_max / model_args.rot_sigma_min)))
@@ -145,12 +166,12 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                     tr_perturb = (0.5 * tr_g ** 2 * dt_tr * tr_score)
                     rot_perturb = (0.5 * rot_score * dt_rot * rot_g ** 2)
                 else:
-                    tr_z = torch.zeros((min(batch_size, N), 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                        else torch.normal(mean=0, std=1, size=(min(batch_size, N), 3), device=device)
+                    tr_z = torch.zeros((b, 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                        else torch.normal(mean=0, std=1, size=(b, 3), device=device)
                     tr_perturb = (tr_g ** 2 * dt_tr * tr_score + tr_g * np.sqrt(dt_tr) * tr_z)
 
-                    rot_z = torch.zeros((min(batch_size, N), 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                        else torch.normal(mean=0, std=1, size=(min(batch_size, N), 3), device=device)
+                    rot_z = torch.zeros((b, 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                        else torch.normal(mean=0, std=1, size=(b, 3), device=device)
                     rot_perturb = (rot_score * dt_rot * rot_g ** 2 + rot_g * np.sqrt(dt_rot) * rot_z)
 
                 if not model_args.no_torsion:
@@ -231,7 +252,9 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                     if hasattr(confidence_model_args, 'crop_beyond') and confidence_model_args.crop_beyond is not None:
                         confidence_complex_graph_batch = confidence_complex_graph_batch.to_data_list()
                         for batch in confidence_complex_graph_batch:
-                            crop_beyond(batch, confidence_model_args.crop_beyond, confidence_model_args.all_atoms)
+                            d2 = torch.sum((batch['ligand'].pos.unsqueeze(0) - batch['receptor'].pos.unsqueeze(1)) ** 2, -1)
+                            if torch.any(torch.any(d2 < confidence_model_args.crop_beyond ** 2, dim=1)):
+                                crop_beyond(batch, confidence_model_args.crop_beyond, confidence_model_args.all_atoms)
                         confidence_complex_graph_batch = Batch.from_data_list(confidence_complex_graph_batch)
 
                     confidence_complex_graph_batch = confidence_complex_graph_batch.to(device)
@@ -246,7 +269,7 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
 
     if confidence_model is not None:
         confidence = torch.cat(confidence, dim=0)
-        confidence = torch.nan_to_num(confidence, nan=-1000)
+        confidence = torch.nan_to_num(confidence, nan=-1000, posinf=-1000, neginf=-1000)
 
     if return_full_trajectory:
         return data_list, confidence, trajectory

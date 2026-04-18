@@ -63,6 +63,8 @@ else:
     np.save('.so3_score_norms4.npy', _score_norms)
     np.save('.so3_exp_score_norms4.npy', _exp_score_norms)
 
+_exp_score_norms_torch_cache = {}
+
 
 def sample(eps):
     eps_idx = (np.log10(eps) - np.log10(MIN_EPS)) / (np.log10(MAX_EPS) - np.log10(MIN_EPS)) * N_EPS
@@ -86,7 +88,22 @@ def score_vec(eps, vec):
     return np.interp(om, _omegas_array, _score_norms[eps_idx]) * vec / om
 
 
+def _exp_score_norms_torch(device):
+    key = str(device)
+    table = _exp_score_norms_torch_cache.get(key)
+    if table is None:
+        table = torch.from_numpy(_exp_score_norms).float().to(device)
+        _exp_score_norms_torch_cache[key] = table
+    return table
+
+
 def score_norm(eps):
+    if isinstance(eps, torch.Tensor):
+        table = _exp_score_norms_torch(eps.device)
+        eps_idx = (torch.log10(eps) - np.log10(MIN_EPS)) / (np.log10(MAX_EPS) - np.log10(MIN_EPS)) * N_EPS
+        eps_idx = torch.clamp(torch.round(eps_idx).long(), min=0, max=N_EPS - 1)
+        return table[eps_idx]
+
     eps = eps.numpy()
     eps_idx = (np.log10(eps) - np.log10(MIN_EPS)) / (np.log10(MAX_EPS) - np.log10(MIN_EPS)) * N_EPS
     eps_idx = np.clip(np.around(eps_idx).astype(int), a_min=0, a_max=N_EPS-1)

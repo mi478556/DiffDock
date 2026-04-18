@@ -1,9 +1,10 @@
+import sys
 import torch
 from torch_geometric.data import Dataset
 
 from datasets.dataloader import DataLoader, DataListLoader
 from datasets.moad import MOAD
-from datasets.pdb import PDBSidechain
+from datasets.pdb_dataset import PDBSidechain
 from datasets.pdbbind import NoiseTransform, PDBBind
 from utils.utils import read_strings_from_txt
 
@@ -57,14 +58,15 @@ def construct_loader(args, t_to_sigma, device):
                        'vandermers_max_dist': args.vandermers_max_dist,
                        'vandermers_buffer_residue_num': args.vandermers_buffer_residue_num,
                        'vandermers_min_contacts': args.vandermers_min_contacts,
-                       'remove_second_segment': args.remove_second_segment,
-                       'merge_clusters': args.merge_clusters}
+                   'remove_second_segment': args.remove_second_segment,
+                   'merge_clusters': args.merge_clusters}
+        
         train_dataset3 = PDBSidechain(cache_path=args.cache_path, split='train', multiplicity=args.train_multiplicity, **common_args)
 
         if args.dataset == 'pdbsidechain':
             train_dataset = train_dataset3
             val_dataset = PDBSidechain(cache_path=args.cache_path, split='val', multiplicity=args.val_multiplicity, **common_args)
-        loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
+        loader_class = DataLoader
 
     if args.dataset in ['pdbbind', 'moad', 'generalisation', 'distillation']:
         common_args = {'transform': transform, 'limit_complexes': args.limit_complexes,
@@ -72,7 +74,7 @@ def construct_loader(args, t_to_sigma, device):
                        'c_alpha_max_neighbors': args.c_alpha_max_neighbors,
                        'remove_hs': args.remove_hs, 'max_lig_size': args.max_lig_size,
                        'matching': not args.no_torsion, 'popsize': args.matching_popsize, 'maxiter': args.matching_maxiter,
-                       'num_workers': args.num_workers, 'all_atoms': args.all_atoms,
+                       'all_atoms': args.all_atoms,
                        'atom_radius': args.atom_radius, 'atom_max_neighbors': args.atom_max_neighbors,
                        'knn_only_graph': False if not hasattr(args, 'not_knn_only_graph') else not args.not_knn_only_graph,
                        'include_miscellaneous_atoms': False if not hasattr(args, 'include_miscellaneous_atoms') else args.include_miscellaneous_atoms,
@@ -83,6 +85,7 @@ def construct_loader(args, t_to_sigma, device):
                                     num_conformers=args.num_conformers, root=args.pdbbind_dir,
                                     esm_embeddings_path=args.pdbbind_esm_embeddings_path,
                                     protein_file=args.protein_file, **common_args)
+            
 
         if args.dataset == 'moad' or args.combined_training:
             train_dataset2 = MOAD(cache_path=args.cache_path, split='train', keep_original=True,
@@ -115,7 +118,7 @@ def construct_loader(args, t_to_sigma, device):
                                unroll_clusters=args.unroll_clusters, root=args.moad_dir,
                                esm_embeddings_path=args.moad_esm_embeddings_path, require_ligand=True, **common_args)
 
-        loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
+        loader_class = DataLoader
 
     train_loader = loader_class(dataset=train_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
     val_loader = loader_class(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=False, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)

@@ -16,6 +16,19 @@ from utils import so3, torus
 from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
 
 
+def safe_spherical_harmonics(irreps, edge_vec, normalize=True, normalization='component'):
+    if normalize:
+        edge_vec = edge_vec.clone()
+        finite = torch.isfinite(edge_vec).all(dim=-1)
+        nonzero = torch.linalg.vector_norm(edge_vec, dim=-1) > 1e-12
+        safe = finite & nonzero
+        if not bool(safe.all()):
+            replacement = torch.zeros_like(edge_vec[~safe])
+            replacement[:, 0] = 1e-12
+            edge_vec[~safe] = replacement
+    return o3.spherical_harmonics(irreps, edge_vec, normalize=normalize, normalization=normalization)
+
+
 class CGModel(torch.nn.Module):
     def __init__(self, t_to_sigma, device, timestep_emb_func, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
                  ns=16, nv=4, num_conv_layers=2, lig_max_radius=5, rec_max_radius=30, cross_max_distance=250,
@@ -260,12 +273,15 @@ class CGModel(torch.nn.Module):
         lig_node_attr = self.lig_node_embedding(lig_node_attr)
         lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
 
-        assert self.embed_also_ligand, "otherwise reimplement padding"
-        for l in range(len(self.lig_emb_layers)):
-            edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_edge_index[0], :self.ns],
-                                    lig_node_attr[lig_edge_index[1], :self.ns]], -1)
-            lig_node_attr = self.lig_emb_layers[l](lig_node_attr, lig_edge_index, edge_attr_, lig_edge_sh,
-                                                   edge_weight=lig_edge_weight)
+        # If ligand embedding via protein-style embedding layers is enabled,
+        # run the ligand embedding layers. Otherwise leave the ligand node
+        # attributes as produced by the atom encoder (no additional padding).
+        if self.embed_also_ligand:
+            for l in range(len(self.lig_emb_layers)):
+                edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_edge_index[0], :self.ns],
+                                        lig_node_attr[lig_edge_index[1], :self.ns]], -1)
+                lig_node_attr = self.lig_emb_layers[l](lig_node_attr, lig_edge_index, edge_attr_, lig_edge_sh,
+                                                       edge_weight=lig_edge_weight)
 
         return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight
 
@@ -386,9 +402,9 @@ class CGModel(torch.nn.Module):
 
         # fix the magnitude of translational and rotational score vectors
         tr_norm = torch.linalg.vector_norm(tr_pred, dim=1).unsqueeze(1)
-        tr_pred = tr_pred / tr_norm * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
+        tr_pred = tr_pred / tr_norm.clamp_min(1e-12) * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
         rot_norm = torch.linalg.vector_norm(rot_pred, dim=1).unsqueeze(1)
-        rot_pred = rot_pred / rot_norm * self.rot_final_layer(torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
+        rot_pred = rot_pred / rot_norm.clamp_min(1e-12) * self.rot_final_layer(torch.cat([rot_norm, data.graph_sigma_emb], dim=1))
 
         if self.scale_by_sigma:
             tr_pred = tr_pred / tr_sigma.unsqueeze(1)
@@ -408,7 +424,7 @@ class CGModel(torch.nn.Module):
         tor_bond_vec = data['ligand'].pos[tor_bonds[1]] - data['ligand'].pos[tor_bonds[0]]
         tor_bond_attr = lig_node_attr[tor_bonds[0]] + lig_node_attr[tor_bonds[1]]
 
-        tor_bonds_sh = o3.spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
+        tor_bonds_sh = safe_spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
         tor_edge_sh = self.final_tp_tor(tor_edge_sh, tor_bonds_sh[tor_edge_index[0]])
 
         tor_edge_attr = torch.cat([tor_edge_attr, lig_node_attr[tor_edge_index[1], :self.ns],
@@ -419,8 +435,13 @@ class CGModel(torch.nn.Module):
         edge_sigma = tor_sigma[data['ligand'].batch][data['ligand', 'ligand'].edge_index[0]][data['ligand'].edge_mask]
 
         if self.scale_by_sigma:
-            tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
-                                             .to(data['ligand'].x.device))
+            sigma_scale = torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
+                                     .to(data['ligand'].x.device))
+            if tor_pred.shape[0] != sigma_scale.shape[0]:
+                n = min(tor_pred.shape[0], sigma_scale.shape[0])
+                tor_pred = tor_pred[:n]
+                sigma_scale = sigma_scale[:n]
+            tor_pred = tor_pred * sigma_scale
         return tr_pred, rot_pred, tor_pred, sidechain_pred
 
     def torsional_forward(self, data):
@@ -441,7 +462,7 @@ class CGModel(torch.nn.Module):
         tor_bond_vec = data['ligand'].pos[tor_bonds[1]] - data['ligand'].pos[tor_bonds[0]]
         tor_bond_attr = lig_node_attr[tor_bonds[0]] + lig_node_attr[tor_bonds[1]]
 
-        tor_bonds_sh = o3.spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
+        tor_bonds_sh = safe_spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
         tor_edge_sh = self.final_tp_tor(tor_edge_sh, tor_bonds_sh[tor_edge_index[0]])
 
         tor_edge_attr = torch.cat([tor_edge_attr, lig_node_attr[tor_edge_index[1], :self.ns],
@@ -452,8 +473,13 @@ class CGModel(torch.nn.Module):
         edge_sigma = tor_sigma[data['ligand'].batch][data['ligand', 'ligand'].edge_index[0]][data['ligand'].edge_mask]
 
         if self.scale_by_sigma:
-            tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
-                                             .to(data['ligand'].x.device))
+            sigma_scale = torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
+                                     .to(data['ligand'].x.device))
+            if tor_pred.shape[0] != sigma_scale.shape[0]:
+                n = min(tor_pred.shape[0], sigma_scale.shape[0])
+                tor_pred = tor_pred[:n]
+                sigma_scale = sigma_scale[:n]
+            tor_pred = tor_pred * sigma_scale
         return 0, 0, tor_pred, 0
 
     def get_edge_weight(self, edge_vec, max_norm):
@@ -491,7 +517,7 @@ class CGModel(torch.nn.Module):
         edge_length_emb = self.lig_distance_expansion(edge_vec.norm(dim=-1))
 
         edge_attr = torch.cat([edge_attr, edge_length_emb], 1)
-        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        edge_sh = safe_spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
         return node_attr, edge_index, edge_attr, edge_sh, edge_weight
@@ -508,7 +534,7 @@ class CGModel(torch.nn.Module):
 
         edge_length_emb = self.rec_distance_expansion(edge_vec.norm(dim=-1))
         edge_attr = edge_length_emb
-        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        edge_sh = safe_spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         edge_weight = self.get_edge_weight(edge_vec, self.rec_max_radius)
 
         return node_attr, edge_attr, edge_sh, edge_weight
@@ -531,7 +557,7 @@ class CGModel(torch.nn.Module):
         edge_length_emb = self.lig_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['misc_atom'].node_sigma_emb[edge_index[0].long()]
         edge_attr = torch.cat([edge_sigma_emb, edge_length_emb], 1)
-        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        edge_sh = safe_spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
         return node_attr, edge_index, edge_attr, edge_sh, edge_weight
@@ -553,8 +579,8 @@ class CGModel(torch.nn.Module):
         edge_length_emb = self.cross_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['ligand'].node_sigma_emb[src.long()]
         edge_attr = torch.cat([edge_sigma_emb, edge_length_emb], 1)
-        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
-        rev_edge_sh = o3.spherical_harmonics(self.sh_irreps, -edge_vec, normalize=True, normalization='component')
+        edge_sh = safe_spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        rev_edge_sh = safe_spherical_harmonics(self.sh_irreps, -edge_vec, normalize=True, normalization='component')
 
         cutoff_d = cross_distance_cutoff[data['ligand'].batch[src]].squeeze() if torch.is_tensor(cross_distance_cutoff) else cross_distance_cutoff
         edge_weight = self.get_edge_weight(edge_vec, cutoff_d)
@@ -578,7 +604,7 @@ class CGModel(torch.nn.Module):
         lr_edge_length_emb = self.cross_distance_expansion(lr_edge_vec.norm(dim=-1))
         lr_edge_sigma_emb = data['ligand'].node_sigma_emb[lr_edge_index[0].long()]
         lr_edge_attr = torch.cat([lr_edge_sigma_emb, lr_edge_length_emb], 1)
-        lr_edge_sh = o3.spherical_harmonics(self.sh_irreps, lr_edge_vec, normalize=True, normalization='component')
+        lr_edge_sh = safe_spherical_harmonics(self.sh_irreps, lr_edge_vec, normalize=True, normalization='component')
 
         cutoff_d = lr_cross_distance_cutoff[data['ligand'].batch[lr_edge_index[0]]].squeeze() \
             if torch.is_tensor(lr_cross_distance_cutoff) else lr_cross_distance_cutoff
@@ -592,7 +618,7 @@ class CGModel(torch.nn.Module):
         la_edge_length_emb = self.cross_distance_expansion(la_edge_vec.norm(dim=-1))
         la_edge_sigma_emb = data['ligand'].node_sigma_emb[la_edge_index[0].long()]
         la_edge_attr = torch.cat([la_edge_sigma_emb, la_edge_length_emb], 1)
-        la_edge_sh = o3.spherical_harmonics(self.sh_irreps, la_edge_vec, normalize=True, normalization='component')
+        la_edge_sh = safe_spherical_harmonics(self.sh_irreps, la_edge_vec, normalize=True, normalization='component')
         la_edge_weight = self.get_edge_weight(la_edge_vec, self.lig_max_radius)
 
         # ATOM to RECEPTOR
@@ -601,7 +627,7 @@ class CGModel(torch.nn.Module):
         ar_edge_length_emb = self.rec_distance_expansion(ar_edge_vec.norm(dim=-1))
         ar_edge_sigma_emb = data['misc_atom'].node_sigma_emb[ar_edge_index[0].long()]
         ar_edge_attr = torch.cat([ar_edge_sigma_emb, ar_edge_length_emb], 1)
-        ar_edge_sh = o3.spherical_harmonics(self.sh_irreps, ar_edge_vec, normalize=True, normalization='component')
+        ar_edge_sh = safe_spherical_harmonics(self.sh_irreps, ar_edge_vec, normalize=True, normalization='component')
         ar_edge_weight = 1
 
         return lr_edge_index, lr_edge_attr, lr_edge_sh, lr_edge_weight, la_edge_index, la_edge_attr, \
@@ -609,17 +635,19 @@ class CGModel(torch.nn.Module):
 
     def build_center_conv_graph(self, data):
         # builds the filter and edges for the convolution generating translational and rotational scores
-        edge_index = torch.cat([data['ligand'].batch.unsqueeze(0), torch.arange(len(data['ligand'].batch)).to(data['ligand'].x.device).unsqueeze(0)], dim=0)
+        ligand_batch = data['ligand'].batch
+        edge_index = torch.stack(
+            (ligand_batch, torch.arange(ligand_batch.numel(), device=ligand_batch.device)),
+            dim=0,
+        )
 
-        center_pos, count = torch.zeros((data.num_graphs, 3)).to(data['ligand'].x.device), torch.zeros((data.num_graphs, 3)).to(data['ligand'].x.device)
-        center_pos.index_add_(0, index=data['ligand'].batch, source=data['ligand'].pos)
-        center_pos = center_pos / torch.bincount(data['ligand'].batch).unsqueeze(1)
+        center_pos = scatter_mean(data['ligand'].pos, data['ligand'].batch, dim=0, dim_size=data.num_graphs)
 
         edge_vec = data['ligand'].pos[edge_index[1]] - center_pos[edge_index[0]]
         edge_attr = self.center_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['ligand'].node_sigma_emb[edge_index[1].long()]
         edge_attr = torch.cat([edge_attr, edge_sigma_emb], 1)
-        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        edge_sh = safe_spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         return edge_index, edge_attr, edge_sh
 
     def build_bond_conv_graph(self, data):
@@ -633,8 +661,7 @@ class CGModel(torch.nn.Module):
         edge_attr = self.lig_distance_expansion(edge_vec.norm(dim=-1))
 
         edge_attr = self.final_edge_embedding(edge_attr)
-        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        edge_sh = safe_spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
         return bonds, edge_index, edge_attr, edge_sh, edge_weight
-

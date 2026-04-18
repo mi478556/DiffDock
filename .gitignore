@@ -165,4 +165,13 @@ temp5.py
 temp6.py
 temp7.py
 esm
+debug_logs/
+
+
+# ignore torsion-specific caches produced by PDBBind when matching is enabled
+cache_torsion*
+
+# ignore top-level scripts and splits directories
+/scripts/
+/splits/
 
