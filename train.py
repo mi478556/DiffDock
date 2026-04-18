@@ -108,9 +108,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_ensemble_samples=args.rank_ensemble_samples,
             rank_ensemble_tr_std=args.rank_ensemble_tr_std,
             rank_ensemble_rot_std=args.rank_ensemble_rot_std,
-            rank_sigma_gate=args.rank_sigma_gate,
             rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
-            rank_sigma_gate_temp=args.rank_sigma_gate_temp,
         )
         val_loss_fn = functools.partial(
             loss_function,

@@ -1,4 +1,5 @@
 import copy
+import os
 import numpy as np
 from rdkit.Chem import RemoveAllHs
 from torch_geometric.loader import DataLoader
@@ -18,6 +19,8 @@ import numpy as np
 import torch
 from utils import so3, torus
 from utils.rank_regularizer import low_rank_contact_loss
+
+
 
 
 def _bf16_forward_context(device):
@@ -43,9 +46,7 @@ def loss_function(
     rank_ensemble_samples: int = 4,
     rank_ensemble_tr_std: float = 0.5,
     rank_ensemble_rot_std: float = 0.15,
-    rank_sigma_gate: bool = False,
-    rank_sigma_gate_cutoff: float = 3.0,
-    rank_sigma_gate_temp: float = 0.5,
+    rank_sigma_gate_cutoff: float = 2.0,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
     if isinstance(data, list):
@@ -138,10 +139,16 @@ def loss_function(
 
     # add our low-rank contact loss, computed from a one-step denoised pose
     if rank_weight > 0.0:
-        rank_loss_raw = low_rank_contact_loss(
+        # Always use a hard cutoff: pass the cutoff into the regularizer so
+        # inactive graphs are skipped before contact-matrix/SVD work.
+        sigma_cutoff = float(rank_sigma_gate_cutoff)
+
+        rank_loss = low_rank_contact_loss(
             data=data,
-            tr_pred=tr_pred.to(pred_device), rot_pred=rot_pred.to(pred_device),
+            tr_pred=tr_pred.to(pred_device),
+            rot_pred=rot_pred.to(pred_device),
             tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
+            sigma_cutoff=sigma_cutoff,
             rank_mode=str(rank_mode),
             rank_k=int(rank_k),
             gaussian_sigma=float(rank_sigma),
@@ -151,31 +158,19 @@ def loss_function(
             ensemble_samples=int(rank_ensemble_samples),
             ensemble_translation_std=float(rank_ensemble_tr_std),
             ensemble_rotation_std=float(rank_ensemble_rot_std),
-            return_per_graph=bool(rank_sigma_gate) or not apply_mean,
+            return_per_graph=not apply_mean,
         )
-        if rank_sigma_gate or not apply_mean:
-            per_graph_rank_loss = rank_loss_raw.reshape(-1)
-        if rank_sigma_gate:
-            if not isinstance(tr_sigma, torch.Tensor):
-                raise ValueError("rank_sigma_gate=True requires tr_sigma")
-            gate_sigma = tr_sigma.to(pred_device).reshape(-1)
-            if gate_sigma.numel() == 1 and per_graph_rank_loss.numel() > 1:
-                gate_sigma = gate_sigma.expand(per_graph_rank_loss.numel())
-            elif gate_sigma.numel() != per_graph_rank_loss.numel():
-                raise ValueError(
-                    f"rank sigma gate has {gate_sigma.numel()} sigma values for "
-                    f"{per_graph_rank_loss.numel()} rank-loss values"
-                )
-            gate_temp = max(float(rank_sigma_gate_temp), 1e-6)
-            gate = torch.sigmoid((float(rank_sigma_gate_cutoff) - gate_sigma) / gate_temp)
-            gated_rank_loss = gate * per_graph_rank_loss
-            rank_gate_mean = gate.mean() if apply_mean else gate
-            rank_loss = gated_rank_loss.mean() if apply_mean else gated_rank_loss
-        elif not apply_mean:
-            rank_gate_mean = torch.ones_like(per_graph_rank_loss)
-            rank_loss = per_graph_rank_loss
-        else:
-            rank_loss = rank_loss_raw
+
+        # Compute per-graph active mask for logging (and diagnostics). This
+        # requires `tr_sigma` to be provided when rank loss is enabled.
+        if not isinstance(tr_sigma, torch.Tensor):
+            raise ValueError("rank loss requires tr_sigma")
+        sigma = tr_sigma.to(pred_device).reshape(-1)
+        if not apply_mean and sigma.numel() == 1 and isinstance(rank_loss, torch.Tensor) and rank_loss.numel() > 1:
+            sigma = sigma.expand_as(rank_loss)
+        active = (sigma <= sigma_cutoff).to(torch.float32)
+        rank_gate_mean = active.mean() if apply_mean else active
+
         loss = loss + rank_weight * rank_loss
 
     if not apply_mean:
@@ -283,7 +278,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             loss = loss_tuple[0]
 
             if torch.any(torch.isnan(loss)):
-                names = data.name if device.type == 'cpu' else [d.name for d in data]
+                names = getattr(data, 'name', 'unknown')
                 print("Nan loss, skipping batch with complexes", names)
                 continue
             score_loss_for_display = loss_tuple[1].detach()

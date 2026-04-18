@@ -3,9 +3,13 @@
 # Works with both DataParallel (CUDA) list batches and single PyG Batch on CPU.
 
 from typing import Optional
+import os
 import torch
 from torch import Tensor
 from torch_scatter import scatter_max, scatter_mean
+
+# One-shot debug print guard for the sigma cutoff active-graph diagnostic.
+RANK_CUTOFF_DEBUG_PRINTED = False
 
 @torch.jit.script
 def _expmap_so3(w: Tensor) -> Tensor:
@@ -202,6 +206,7 @@ def _build_contact_matrices_from_ligand_positions(
     lig_pos: Tensor,
     gaussian_sigma: float = 2.0,
     use_receptor_atoms: bool = True,
+    active_graph_mask: Optional[Tensor] = None,
 ):
     device = lig_pos.device
     lig_batch = _make_batch_index(data, 'ligand').to(device)
@@ -216,8 +221,26 @@ def _build_contact_matrices_from_ligand_positions(
         rec_pos = _stack_graph_field(data, 'receptor', 'pos').to(device)
         rec_batch = _make_batch_index(data, 'receptor').to(device)
 
+    B = _num_graphs(data)
+
+    # Normalize optional active mask to one boolean per graph on the same device
+    if active_graph_mask is not None:
+        active_graph_mask = active_graph_mask.to(device).reshape(-1).bool()
+        if active_graph_mask.numel() == 1 and B > 1:
+            active_graph_mask = active_graph_mask.expand(B)
+        elif active_graph_mask.numel() != B:
+            raise ValueError(
+                f"active_graph_mask must have one value per graph; got "
+                f"{active_graph_mask.numel()} values for {B} graphs"
+            )
+
     out = []
-    for b in range(_num_graphs(data)):
+    for b in range(B):
+        # Skip inactive graphs early to avoid cdist / SVD work
+        if active_graph_mask is not None and not bool(active_graph_mask[b].item()):
+            out.append(None)
+            continue
+
         lmask = lig_batch == b
         rmask = rec_batch == b
         L = lig_pos[lmask & lig_mask_heavy]
@@ -262,6 +285,7 @@ def low_rank_contact_loss(
     tr_pred: Tensor,                 # [B,3]
     rot_pred: Tensor,                # [B,3]
     tr_sigma: Optional[Tensor] = None,   # [B,1] from loss_function
+    sigma_cutoff: Optional[float] = None,
     rank_mode: str = 'single',
     rank_k: int = 8,
     gaussian_sigma: float = 2.0,
@@ -282,6 +306,40 @@ def low_rank_contact_loss(
     """
     device = tr_pred.device
     B = _num_graphs(data)
+
+    # Optional sigma cutoff: compute an active per-graph mask and early-return
+    # when no graphs are active to avoid wasted SVD/contact construction work.
+    active_graph_mask = None
+    active_graph_weight = None
+    if sigma_cutoff is not None:
+        if tr_sigma is None:
+            raise ValueError("sigma_cutoff requires tr_sigma")
+
+        sigma = tr_sigma.to(device).reshape(-1)
+        if sigma.numel() == 1 and B > 1:
+            sigma = sigma.expand(B)
+        elif sigma.numel() != B:
+            raise ValueError(
+                f"tr_sigma must be scalar or have one value per graph; got "
+                f"{sigma.numel()} values for {B} graphs"
+            )
+
+        active_graph_mask = sigma <= float(sigma_cutoff)
+        active_graph_weight = active_graph_mask.to(dtype=tr_pred.dtype)
+        # Optional one-shot debug print for active graph counts.
+        global RANK_CUTOFF_DEBUG_PRINTED
+        if os.environ.get('RANK_SIGMA_CUTOFF_DEBUG') and not RANK_CUTOFF_DEBUG_PRINTED:
+            try:
+                print("active graphs:", int(active_graph_mask.sum().item()), "of", int(active_graph_mask.numel()))
+            except Exception:
+                print("rank_regularizer debug: failed to print active graph info")
+            RANK_CUTOFF_DEBUG_PRINTED = True
+
+        # nothing active -> short-circuit
+        if int(active_graph_weight.sum().item()) == 0:
+            if return_per_graph:
+                return tr_pred.new_zeros((B,))
+            return tr_pred.new_tensor(0.0)
 
     # ensure graph tensors live on the same device as model predictions
     lig_pos_t = _stack_graph_field(data, 'ligand', 'pos').to(device)           # [NL,3]
@@ -307,6 +365,7 @@ def low_rank_contact_loss(
         lig_pos_hat,
         gaussian_sigma=gaussian_sigma,
         use_receptor_atoms=use_receptor_atoms,
+        active_graph_mask=active_graph_mask,
     )
 
     single_terms = []
@@ -316,7 +375,10 @@ def low_rank_contact_loss(
             continue
         single_terms.append(_tail_energy_from_contact_matrix(M, rank_k=rank_k, normalize=True))
     single_per_graph = torch.stack(single_terms) if len(single_terms) > 0 else lig_pos_hat.new_zeros((B,))
-    single_loss = single_per_graph.mean()
+    if active_graph_weight is None:
+        single_loss = single_per_graph.mean()
+    else:
+        single_loss = (single_per_graph * active_graph_weight).sum() / active_graph_weight.sum().clamp_min(1.0)
 
     if rank_mode == 'single':
         return single_per_graph if return_per_graph else single_loss
@@ -336,6 +398,7 @@ def low_rank_contact_loss(
             sample_pos,
             gaussian_sigma=gaussian_sigma,
             use_receptor_atoms=use_receptor_atoms,
+            active_graph_mask=active_graph_mask,
         )
         for graph_idx, M in enumerate(sample_contact_mats):
             if M is not None:
@@ -348,7 +411,10 @@ def low_rank_contact_loss(
             continue
         ensemble_terms.append(stacked_low_rank_tail_energy(matrix_list, rank_k=rank_k, normalize=False))
     ensemble_per_graph_terms = torch.stack(ensemble_terms) if len(ensemble_terms) > 0 else lig_pos_hat.new_zeros((B,))
-    ensemble_loss = ensemble_per_graph_terms.mean()
+    if active_graph_weight is None:
+        ensemble_loss = ensemble_per_graph_terms.mean()
+    else:
+        ensemble_loss = (ensemble_per_graph_terms * active_graph_weight).sum() / active_graph_weight.sum().clamp_min(1.0)
 
     if rank_mode == 'ensemble':
         return ensemble_per_graph_terms if return_per_graph else ensemble_loss
@@ -356,7 +422,9 @@ def low_rank_contact_loss(
         fusion_per_graph = torch.log1p(single_per_graph) + torch.log1p(ensemble_per_graph_terms)
         if return_per_graph:
             return fusion_per_graph
-        return torch.log1p(single_loss) + torch.log1p(ensemble_loss)
+        if active_graph_weight is None:
+            return fusion_per_graph.mean()
+        return (fusion_per_graph * active_graph_weight).sum() / active_graph_weight.sum().clamp_min(1.0)
 
     raise ValueError(f'Unknown rank_mode: {rank_mode}')
 
