@@ -47,6 +47,11 @@ def loss_function(
     rank_ensemble_tr_std: float = 0.5,
     rank_ensemble_rot_std: float = 0.15,
     rank_sigma_gate_cutoff: float = 2.0,
+    rank_gate_type: str = 'hard',
+    rank_soft_gate_cutoff: float = 2.0,
+    rank_soft_gate_temp: float = 0.5,
+    rank_prune_eps: float = 0.02,
+    rank_prune_sigma_cutoff: float = None,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
     if isinstance(data, list):
@@ -139,37 +144,79 @@ def loss_function(
 
     # add our low-rank contact loss, computed from a one-step denoised pose
     if rank_weight > 0.0:
-        # Always use a hard cutoff: pass the cutoff into the regularizer so
-        # inactive graphs are skipped before contact-matrix/SVD work.
-        sigma_cutoff = float(rank_sigma_gate_cutoff)
-
-        rank_loss = low_rank_contact_loss(
-            data=data,
-            tr_pred=tr_pred.to(pred_device),
-            rot_pred=rot_pred.to(pred_device),
-            tr_sigma=tr_sigma.to(pred_device) if isinstance(tr_sigma, torch.Tensor) else None,
-            sigma_cutoff=sigma_cutoff,
-            rank_mode=str(rank_mode),
-            rank_k=int(rank_k),
-            gaussian_sigma=float(rank_sigma),
-            alpha_tr=float(rank_alpha_tr),
-            alpha_rot=float(rank_alpha_rot),
-            use_receptor_atoms=True,
-            ensemble_samples=int(rank_ensemble_samples),
-            ensemble_translation_std=float(rank_ensemble_tr_std),
-            ensemble_rotation_std=float(rank_ensemble_rot_std),
-            return_per_graph=not apply_mean,
-        )
-
-        # Compute per-graph active mask for logging (and diagnostics). This
-        # requires `tr_sigma` to be provided when rank loss is enabled.
         if not isinstance(tr_sigma, torch.Tensor):
             raise ValueError("rank loss requires tr_sigma")
         sigma = tr_sigma.to(pred_device).reshape(-1)
-        if not apply_mean and sigma.numel() == 1 and isinstance(rank_loss, torch.Tensor) and rank_loss.numel() > 1:
-            sigma = sigma.expand_as(rank_loss)
-        active = (sigma <= sigma_cutoff).to(torch.float32)
-        rank_gate_mean = active.mean() if apply_mean else active
+        if sigma.numel() == 1:
+            if isinstance(data, list):
+                num_graphs = len(data)
+            else:
+                num_graphs = int(data.num_graphs)
+            sigma = sigma.expand(num_graphs)
+
+        rank_gate_type = str(rank_gate_type).lower()
+        if rank_gate_type == 'hard':
+            # Historical hard-gate objective: prune inactive graphs and reduce
+            # over active graphs inside the regularizer.
+            sigma_cutoff = float(rank_sigma_gate_cutoff)
+            rank_loss = low_rank_contact_loss(
+                data=data,
+                tr_pred=tr_pred.to(pred_device),
+                rot_pred=rot_pred.to(pred_device),
+                tr_sigma=tr_sigma.to(pred_device),
+                sigma_cutoff=sigma_cutoff,
+                rank_mode=str(rank_mode),
+                rank_k=int(rank_k),
+                gaussian_sigma=float(rank_sigma),
+                alpha_tr=float(rank_alpha_tr),
+                alpha_rot=float(rank_alpha_rot),
+                use_receptor_atoms=True,
+                ensemble_samples=int(rank_ensemble_samples),
+                ensemble_translation_std=float(rank_ensemble_tr_std),
+                ensemble_rotation_std=float(rank_ensemble_rot_std),
+                return_per_graph=not apply_mean,
+            )
+            if not apply_mean and sigma.numel() == 1 and isinstance(rank_loss, torch.Tensor) and rank_loss.numel() > 1:
+                sigma = sigma.expand_as(rank_loss)
+            active = (sigma <= sigma_cutoff).to(torch.float32)
+            rank_gate_mean = active.mean() if apply_mean else active
+        elif rank_gate_type in ('soft', 'soft_prune'):
+            # Soft objective: always apply the sigmoid gate outside the
+            # regularizer and keep the full-batch mean reduction.
+            gate_soft = torch.sigmoid(
+                (float(rank_soft_gate_cutoff) - sigma) / float(rank_soft_gate_temp)
+            ).to(dtype=tr_pred.dtype)
+
+            active_graph_mask = None
+            if rank_gate_type == 'soft_prune':
+                if rank_prune_sigma_cutoff is not None:
+                    active_graph_mask = sigma <= float(rank_prune_sigma_cutoff)
+                else:
+                    active_graph_mask = gate_soft > float(rank_prune_eps)
+
+            per_graph_rank_loss = low_rank_contact_loss(
+                data=data,
+                tr_pred=tr_pred.to(pred_device),
+                rot_pred=rot_pred.to(pred_device),
+                tr_sigma=tr_sigma.to(pred_device),
+                sigma_cutoff=None,
+                active_graph_mask=active_graph_mask,
+                rank_mode=str(rank_mode),
+                rank_k=int(rank_k),
+                gaussian_sigma=float(rank_sigma),
+                alpha_tr=float(rank_alpha_tr),
+                alpha_rot=float(rank_alpha_rot),
+                use_receptor_atoms=True,
+                ensemble_samples=int(rank_ensemble_samples),
+                ensemble_translation_std=float(rank_ensemble_tr_std),
+                ensemble_rotation_std=float(rank_ensemble_rot_std),
+                return_per_graph=True,
+            )
+            rank_loss_per_graph = gate_soft * per_graph_rank_loss
+            rank_loss = rank_loss_per_graph.mean() if apply_mean else rank_loss_per_graph
+            rank_gate_mean = gate_soft.mean() if apply_mean else gate_soft
+        else:
+            raise ValueError(f"Unknown rank_gate_type: {rank_gate_type}")
 
         loss = loss + rank_weight * rank_loss
 

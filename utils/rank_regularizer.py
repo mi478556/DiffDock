@@ -286,6 +286,7 @@ def low_rank_contact_loss(
     rot_pred: Tensor,                # [B,3]
     tr_sigma: Optional[Tensor] = None,   # [B,1] from loss_function
     sigma_cutoff: Optional[float] = None,
+    active_graph_mask: Optional[Tensor] = None,
     rank_mode: str = 'single',
     rank_k: int = 8,
     gaussian_sigma: float = 2.0,
@@ -307,11 +308,23 @@ def low_rank_contact_loss(
     device = tr_pred.device
     B = _num_graphs(data)
 
-    # Optional sigma cutoff: compute an active per-graph mask and early-return
-    # when no graphs are active to avoid wasted SVD/contact construction work.
-    active_graph_mask = None
+    if sigma_cutoff is not None and active_graph_mask is not None:
+        raise ValueError("Pass only one of sigma_cutoff or active_graph_mask")
+
+    # Optional active graph mask: either supplied directly by the caller or
+    # derived from a hard sigma cutoff. This only controls compute pruning.
     active_graph_weight = None
-    if sigma_cutoff is not None:
+    if active_graph_mask is not None:
+        active_graph_mask = active_graph_mask.to(device).reshape(-1).bool()
+        if active_graph_mask.numel() == 1 and B > 1:
+            active_graph_mask = active_graph_mask.expand(B)
+        elif active_graph_mask.numel() != B:
+            raise ValueError(
+                f"active_graph_mask must be scalar or have one value per graph; got "
+                f"{active_graph_mask.numel()} values for {B} graphs"
+            )
+        active_graph_weight = active_graph_mask.to(dtype=tr_pred.dtype)
+    elif sigma_cutoff is not None:
         if tr_sigma is None:
             raise ValueError("sigma_cutoff requires tr_sigma")
 
@@ -326,6 +339,8 @@ def low_rank_contact_loss(
 
         active_graph_mask = sigma <= float(sigma_cutoff)
         active_graph_weight = active_graph_mask.to(dtype=tr_pred.dtype)
+
+    if active_graph_mask is not None:
         # Optional one-shot debug print for active graph counts.
         global RANK_CUTOFF_DEBUG_PRINTED
         if os.environ.get('RANK_SIGMA_CUTOFF_DEBUG') and not RANK_CUTOFF_DEBUG_PRINTED:
