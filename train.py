@@ -53,8 +53,14 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                 'epoch',
                 'train_score_loss', 'train_total_loss', 'train_tr_loss', 'train_rot_loss', 'train_tor_loss',
                 'train_rank_loss', 'train_rank_contribution', 'train_rank_gate_mean',
+                'train_rank_teacher_loss', 'train_rank_teacher_contribution', 'train_rank_teacher_tr_loss',
+                'train_rank_teacher_rot_loss', 'train_rank_teacher_active_mean',
+                'train_rank_teacher_tr_cos', 'train_rank_teacher_rot_cos',
                 'val_score_loss', 'val_total_loss', 'val_tr_loss', 'val_rot_loss', 'val_tor_loss',
                 'val_rank_loss', 'val_rank_contribution', 'val_rank_gate_mean',
+                'val_rank_teacher_loss', 'val_rank_teacher_contribution', 'val_rank_teacher_tr_loss',
+                'val_rank_teacher_rot_loss', 'val_rank_teacher_active_mean',
+                'val_rank_teacher_tr_cos', 'val_rank_teacher_rot_cos',
                 'valinf_rmsds_lt2', 'valinf_rmsds_lt5', 'valinf_min_rmsds_lt2', 'valinf_min_rmsds_lt5',
                 'valinf2_rmsds_lt2', 'valinf2_rmsds_lt5', 'valinf2_min_rmsds_lt2', 'valinf2_min_rmsds_lt5',
                 'valinfcomb_rmsds_lt2', 'valinfcomb_rmsds_lt5',
@@ -114,6 +120,12 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_soft_gate_temp=args.rank_soft_gate_temp,
             rank_prune_eps=args.rank_prune_eps,
             rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
+            rank_teacher_weight=args.rank_teacher_weight,
+            rank_teacher_tr_weight=args.rank_teacher_tr_weight,
+            rank_teacher_rot_weight=args.rank_teacher_rot_weight,
+            rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
+            rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
+            rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
         )
         val_loss_fn = functools.partial(
             loss_function,
@@ -121,7 +133,27 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rot_weight=1.0,
             tor_weight=1.0,
             no_torsion=args.no_torsion,
-            rank_weight=0.0,
+            rank_weight=args.rank_weight,
+            rank_mode=args.rank_mode,
+            rank_k=args.rank_k,
+            rank_sigma=args.rank_sigma,
+            rank_alpha_tr=args.rank_alpha_tr,
+            rank_alpha_rot=args.rank_alpha_rot,
+            rank_ensemble_samples=args.rank_ensemble_samples,
+            rank_ensemble_tr_std=args.rank_ensemble_tr_std,
+            rank_ensemble_rot_std=args.rank_ensemble_rot_std,
+            rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
+            rank_gate_type=args.rank_gate_type,
+            rank_soft_gate_cutoff=args.rank_soft_gate_cutoff,
+            rank_soft_gate_temp=args.rank_soft_gate_temp,
+            rank_prune_eps=args.rank_prune_eps,
+            rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
+            rank_teacher_weight=args.rank_teacher_weight,
+            rank_teacher_tr_weight=args.rank_teacher_tr_weight,
+            rank_teacher_rot_weight=args.rank_teacher_rot_weight,
+            rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
+            rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
+            rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
         )
         train_losses = train_epoch(
             model,
@@ -136,6 +168,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         print("Epoch {}: Training score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['score_loss'], train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                       train_losses['tor_loss'], train_losses['rank_loss'], train_losses.get('rank_gate_mean', 1.0), optimizer.param_groups[0]['lr']))
+        print("Epoch {}: Training teacher {:.4f}  teacher_tr {:.4f}  teacher_rot {:.4f}  teacher_active {:.4f}  teacher_tr_cos {:.4f}  teacher_rot_cos {:.4f}"
+              .format(epoch, train_losses.get('rank_teacher_loss', 0.0), train_losses.get('rank_teacher_tr_loss', 0.0),
+                      train_losses.get('rank_teacher_rot_loss', 0.0), train_losses.get('rank_teacher_active_mean', 0.0),
+                      train_losses.get('rank_teacher_tr_cos', 0.0), train_losses.get('rank_teacher_rot_cos', 0.0)))
 
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
@@ -143,6 +179,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         val_losses = test_epoch(model, val_loader, device, t_to_sigma, val_loss_fn, args.test_sigma_intervals)
         print("Epoch {}: Validation score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}"
               .format(epoch, val_losses['score_loss'], val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['rank_loss'], val_losses.get('rank_gate_mean', 1.0)))
+        print("Epoch {}: Validation teacher {:.4f}  teacher_tr {:.4f}  teacher_rot {:.4f}  teacher_active {:.4f}  teacher_tr_cos {:.4f}  teacher_rot_cos {:.4f}"
+              .format(epoch, val_losses.get('rank_teacher_loss', 0.0), val_losses.get('rank_teacher_tr_loss', 0.0),
+                      val_losses.get('rank_teacher_rot_loss', 0.0), val_losses.get('rank_teacher_active_mean', 0.0),
+                      val_losses.get('rank_teacher_tr_cos', 0.0), val_losses.get('rank_teacher_rot_cos', 0.0)))
         val_selection_loss = val_losses.get('score_loss', val_losses['loss'])
 
         if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
@@ -238,6 +278,14 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     args.rank_weight * val_losses.get('rank_loss')
                     if isinstance(val_losses, dict) and val_losses.get('rank_loss') is not None else None
                 )
+                train_rank_teacher_contribution = (
+                    args.rank_teacher_weight * train_losses.get('rank_teacher_loss')
+                    if isinstance(train_losses, dict) and train_losses.get('rank_teacher_loss') is not None else None
+                )
+                val_rank_teacher_contribution = (
+                    args.rank_teacher_weight * val_losses.get('rank_teacher_loss')
+                    if isinstance(val_losses, dict) and val_losses.get('rank_teacher_loss') is not None else None
+                )
 
                 csv_writer.writerow([
                     epoch,
@@ -249,6 +297,13 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     train_losses.get('rank_loss') if isinstance(train_losses, dict) else None,
                     train_rank_contribution,
                     train_losses.get('rank_gate_mean') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_teacher_loss') if isinstance(train_losses, dict) else None,
+                    train_rank_teacher_contribution,
+                    train_losses.get('rank_teacher_tr_loss') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_teacher_rot_loss') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_teacher_active_mean') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_teacher_tr_cos') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_teacher_rot_cos') if isinstance(train_losses, dict) else None,
                     val_losses.get('score_loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('tr_loss') if isinstance(val_losses, dict) else None,
@@ -257,6 +312,13 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     val_losses.get('rank_loss') if isinstance(val_losses, dict) else None,
                     val_rank_contribution,
                     val_losses.get('rank_gate_mean') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_teacher_loss') if isinstance(val_losses, dict) else None,
+                    val_rank_teacher_contribution,
+                    val_losses.get('rank_teacher_tr_loss') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_teacher_rot_loss') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_teacher_active_mean') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_teacher_tr_cos') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_teacher_rot_cos') if isinstance(val_losses, dict) else None,
                     logs.get('valinf_rmsds_lt2'),
                     logs.get('valinf_rmsds_lt5'),
                     logs.get('valinf_min_rmsds_lt2'),
@@ -288,6 +350,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                         tb_writer.add_scalar('train/rank_contribution', train_rank_contribution, epoch)
                     if val_rank_contribution is not None:
                         tb_writer.add_scalar('val/rank_contribution', val_rank_contribution, epoch)
+                    if train_rank_teacher_contribution is not None:
+                        tb_writer.add_scalar('train/rank_teacher_contribution', train_rank_teacher_contribution, epoch)
+                    if val_rank_teacher_contribution is not None:
+                        tb_writer.add_scalar('val/rank_teacher_contribution', val_rank_teacher_contribution, epoch)
                     for metric_key, metric_value in logs.items():
                         if metric_key.startswith(('valinf_', 'valinf2_', 'valinfcomb_', 'traininf_')):
                             tb_writer.add_scalar(metric_key.replace('_', '/', 1), metric_value, epoch)
@@ -299,11 +365,15 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     if isinstance(val_losses, dict) and val_losses.get('rank_gate_mean') is not None:
                         tb_writer.add_scalar('val/rank_gate_mean', val_losses.get('rank_gate_mean'), epoch)
                     if isinstance(train_losses, dict):
-                        for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss']:
+                        for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_teacher_loss',
+                                  'rank_teacher_tr_loss', 'rank_teacher_rot_loss', 'rank_teacher_active_mean',
+                                  'rank_teacher_tr_cos', 'rank_teacher_rot_cos']:
                             if train_losses.get(k) is not None:
                                 tb_writer.add_scalar(f'train/{k}', train_losses.get(k), epoch)
                     if isinstance(val_losses, dict):
-                        for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss']:
+                        for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_teacher_loss',
+                                  'rank_teacher_tr_loss', 'rank_teacher_rot_loss', 'rank_teacher_active_mean',
+                                  'rank_teacher_tr_cos', 'rank_teacher_rot_cos']:
                             if val_losses.get(k) is not None:
                                 tb_writer.add_scalar(f'val/{k}', val_losses.get(k), epoch)
                     tb_writer.flush()

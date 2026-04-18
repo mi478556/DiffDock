@@ -129,6 +129,15 @@ def _tail_energy_from_contact_matrix(M: Tensor, rank_k: int, normalize: bool = T
     return tail_energy
 
 
+def _normalize_graph_vector(value: Tensor, num_graphs: int, name: str) -> Tensor:
+    value = value.reshape(-1)
+    if value.numel() == 1 and num_graphs > 1:
+        return value.expand(num_graphs)
+    if value.numel() != num_graphs:
+        raise ValueError(f"{name} must be scalar or have one value per graph; got {value.numel()} for {num_graphs}")
+    return value
+
+
 def _smooth_contact_matrix_from_distances(distances: Tensor, gaussian_sigma: float = 2.0) -> Tensor:
     sigma2 = float(gaussian_sigma) ** 2
     return torch.exp(-(distances * distances) / sigma2).clamp_min(1e-6)
@@ -199,6 +208,181 @@ def _ensemble_positions_from_base(
         step_rot = torch.ones(num_graphs, device=base_lig_pos.device, dtype=base_lig_pos.dtype)
         out.append(_apply_one_step_se3(base_lig_pos, lig_batch, tr_noise, rot_noise, step_tr, step_rot))
     return out
+
+
+def rank_energy_per_graph_from_ligand_positions(
+    data,
+    lig_pos: Tensor,
+    rank_mode: str = 'single',
+    rank_k: int = 8,
+    gaussian_sigma: float = 2.0,
+    use_receptor_atoms: bool = True,
+    active_graph_mask: Optional[Tensor] = None,
+    ensemble_samples: int = 4,
+    ensemble_translation_std: float = 0.5,
+    ensemble_rotation_std: float = 0.15,
+) -> Tensor:
+    """
+    Rank-SVD contact energy for an already-built ligand pose.
+
+    This is used by the detached SE(3) teacher: the input ligand coordinates
+    can require gradients, but the model predictions do not have to stay in
+    the graph. Pruned-out graphs return zero energy.
+    """
+    device = lig_pos.device
+    B = _num_graphs(data)
+    lig_batch = _make_batch_index(data, 'ligand').to(device)
+    if active_graph_mask is not None:
+        active_graph_mask = _normalize_graph_vector(active_graph_mask.to(device).bool(), B, "active_graph_mask")
+
+    single_contact_mats = _build_contact_matrices_from_ligand_positions(
+        data,
+        lig_pos,
+        gaussian_sigma=gaussian_sigma,
+        use_receptor_atoms=use_receptor_atoms,
+        active_graph_mask=active_graph_mask,
+    )
+    single_terms = []
+    for M in single_contact_mats:
+        if M is None:
+            single_terms.append(lig_pos.new_tensor(0.0))
+        else:
+            single_terms.append(_tail_energy_from_contact_matrix(M, rank_k=rank_k, normalize=True))
+    single_per_graph = torch.stack(single_terms) if single_terms else lig_pos.new_zeros((B,))
+    if rank_mode == 'single':
+        return single_per_graph
+
+    ensemble_positions = _ensemble_positions_from_base(
+        lig_pos,
+        lig_batch,
+        B,
+        ensemble_samples=ensemble_samples,
+        translation_std=ensemble_translation_std,
+        rotation_std=ensemble_rotation_std,
+    )
+    ensemble_per_graph = [[] for _ in range(B)]
+    for sample_pos in ensemble_positions:
+        sample_contact_mats = _build_contact_matrices_from_ligand_positions(
+            data,
+            sample_pos,
+            gaussian_sigma=gaussian_sigma,
+            use_receptor_atoms=use_receptor_atoms,
+            active_graph_mask=active_graph_mask,
+        )
+        for graph_idx, M in enumerate(sample_contact_mats):
+            if M is not None:
+                ensemble_per_graph[graph_idx].append(M)
+
+    ensemble_terms = []
+    for matrix_list in ensemble_per_graph:
+        if len(matrix_list) == 0:
+            ensemble_terms.append(lig_pos.new_tensor(0.0))
+            continue
+        ensemble_terms.append(stacked_low_rank_tail_energy(matrix_list, rank_k=rank_k, normalize=False))
+    ensemble_per_graph_terms = torch.stack(ensemble_terms) if ensemble_terms else lig_pos.new_zeros((B,))
+
+    if rank_mode == 'ensemble':
+        return ensemble_per_graph_terms
+    if rank_mode == 'fusion_log1p_sum':
+        return torch.log1p(single_per_graph) + torch.log1p(ensemble_per_graph_terms)
+    raise ValueError(f'Unknown rank_mode: {rank_mode}')
+
+
+def project_ligand_gradient_to_se3(data, lig_pos: Tensor, grad: Tensor):
+    """
+    Project an atom-coordinate rank-energy gradient into rigid translation and
+    rotation teacher vectors. The returned vectors point down the rank energy.
+    """
+    device = lig_pos.device
+    B = _num_graphs(data)
+    lig_batch = _make_batch_index(data, 'ligand').to(device)
+    lig_x = _stack_graph_field(data, 'ligand', 'x').to(device)
+    heavy = _heavy_atom_mask(lig_x)
+    force = -grad
+    teacher_tr = lig_pos.new_zeros((B, 3))
+    teacher_rot = lig_pos.new_zeros((B, 3))
+    for graph_idx in range(B):
+        mask = (lig_batch == graph_idx) & heavy
+        if not bool(mask.any().item()):
+            continue
+        pos = lig_pos[mask]
+        graph_force = force[mask]
+        center = pos.mean(dim=0, keepdim=True)
+        rel_pos = pos - center
+        teacher_tr[graph_idx] = graph_force.sum(dim=0)
+        teacher_rot[graph_idx] = torch.cross(rel_pos, graph_force, dim=1).sum(dim=0)
+    return teacher_tr, teacher_rot
+
+
+def detached_rank_se3_teacher(
+    data,
+    tr_pred: Tensor,
+    rot_pred: Tensor,
+    tr_sigma: Tensor,
+    gate: Tensor,
+    active_graph_mask: Optional[Tensor] = None,
+    rank_mode: str = 'single',
+    rank_k: int = 8,
+    gaussian_sigma: float = 2.0,
+    alpha_tr: float = 0.25,
+    alpha_rot: float = 0.25,
+    use_receptor_atoms: bool = True,
+    ensemble_samples: int = 4,
+    ensemble_translation_std: float = 0.5,
+    ensemble_rotation_std: float = 0.15,
+):
+    """
+    Build a detached analytic SE(3) teacher from the local rank-energy gradient.
+
+    The teacher is detached from the rank-energy/SVD graph, so using it as an
+    auxiliary target does not introduce higher-order gradients through the SVD.
+    """
+    device = tr_pred.device
+    B = _num_graphs(data)
+    gate = _normalize_graph_vector(gate.to(device), B, "gate").to(dtype=tr_pred.dtype)
+    if active_graph_mask is not None:
+        active_graph_mask = _normalize_graph_vector(active_graph_mask.to(device).bool(), B, "active_graph_mask")
+
+    if active_graph_mask is not None and int(active_graph_mask.sum().item()) == 0:
+        zeros = tr_pred.new_zeros((B, 3))
+        return zeros, zeros, tr_pred.new_zeros((B,))
+
+    with torch.enable_grad():
+        lig_pos_t = _stack_graph_field(data, 'ligand', 'pos').to(device)
+        lig_batch = _make_batch_index(data, 'ligand').to(device)
+        sigma = _normalize_graph_vector(tr_sigma.to(device), B, "tr_sigma")
+        step_tr = float(alpha_tr) * sigma.clamp_min(1e-3)
+        step_rot = torch.full((B,), float(alpha_rot), device=device, dtype=tr_pred.dtype)
+
+        base_pos = _apply_one_step_se3(
+            lig_pos_t,
+            lig_batch,
+            tr_pred.detach(),
+            rot_pred.detach(),
+            step_tr.to(dtype=tr_pred.dtype),
+            step_rot,
+        )
+        probe_pos = base_pos.detach().clone().requires_grad_(True)
+        rank_energy = rank_energy_per_graph_from_ligand_positions(
+            data=data,
+            lig_pos=probe_pos,
+            rank_mode=rank_mode,
+            rank_k=rank_k,
+            gaussian_sigma=gaussian_sigma,
+            use_receptor_atoms=use_receptor_atoms,
+            active_graph_mask=active_graph_mask,
+            ensemble_samples=ensemble_samples,
+            ensemble_translation_std=ensemble_translation_std,
+            ensemble_rotation_std=ensemble_rotation_std,
+        )
+        weighted_energy = (gate.to(dtype=rank_energy.dtype) * rank_energy).sum()
+        if weighted_energy.requires_grad:
+            grad = torch.autograd.grad(weighted_energy, probe_pos, retain_graph=False, create_graph=False)[0]
+        else:
+            grad = torch.zeros_like(probe_pos)
+
+    teacher_tr, teacher_rot = project_ligand_gradient_to_se3(data, probe_pos.detach(), grad.detach())
+    return teacher_tr.detach(), teacher_rot.detach(), rank_energy.detach()
 
 
 def _build_contact_matrices_from_ligand_positions(

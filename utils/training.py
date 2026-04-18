@@ -18,7 +18,7 @@ from utils.diffusion_utils import get_t_schedule
 import numpy as np
 import torch
 from utils import so3, torus
-from utils.rank_regularizer import low_rank_contact_loss
+from utils.rank_regularizer import detached_rank_se3_teacher, low_rank_contact_loss
 
 
 
@@ -30,6 +30,19 @@ def _bf16_forward_context(device):
 
 def _as_fp32_prediction(pred):
     return pred.float() if isinstance(pred, torch.Tensor) else pred
+
+
+def _cosine_teacher_loss(pred, teacher, gate, min_teacher_norm):
+    pred = pred.float()
+    teacher = teacher.detach().float()
+    pred_norm = torch.linalg.vector_norm(pred, dim=-1)
+    teacher_norm = torch.linalg.vector_norm(teacher, dim=-1)
+    denom = (pred_norm * teacher_norm).clamp_min(1e-12)
+    cosine = (pred * teacher).sum(dim=-1) / denom
+    valid = teacher_norm > float(min_teacher_norm)
+    per_graph = torch.where(valid, 1.0 - cosine, torch.zeros_like(cosine))
+    weighted = gate.to(dtype=per_graph.dtype) * per_graph
+    return weighted, valid.to(dtype=per_graph.dtype), cosine.detach()
 
 
 def loss_function(
@@ -52,6 +65,12 @@ def loss_function(
     rank_soft_gate_temp: float = 0.5,
     rank_prune_eps: float = 0.02,
     rank_prune_sigma_cutoff: float = None,
+    rank_teacher_weight: float = 0.0,
+    rank_teacher_tr_weight: float = 1.0,
+    rank_teacher_rot_weight: float = 1.0,
+    rank_teacher_min_tr_norm: float = 1e-6,
+    rank_teacher_min_rot_norm: float = 1e-6,
+    rank_teacher_use_rot_sign_flip: bool = False,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
     if isinstance(data, list):
@@ -141,9 +160,15 @@ def loss_function(
 
     rank_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
     rank_gate_mean = torch.ones(1, dtype=torch.float, device=pred_device)
+    rank_teacher_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_teacher_tr_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_teacher_rot_loss = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_teacher_active_mean = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_teacher_tr_cos = torch.zeros(1, dtype=torch.float, device=pred_device)
+    rank_teacher_rot_cos = torch.zeros(1, dtype=torch.float, device=pred_device)
 
     # add our low-rank contact loss, computed from a one-step denoised pose
-    if rank_weight > 0.0:
+    if rank_weight > 0.0 or rank_teacher_weight > 0.0:
         if not isinstance(tr_sigma, torch.Tensor):
             raise ValueError("rank loss requires tr_sigma")
         sigma = tr_sigma.to(pred_device).reshape(-1)
@@ -155,7 +180,16 @@ def loss_function(
             sigma = sigma.expand(num_graphs)
 
         rank_gate_type = str(rank_gate_type).lower()
-        if rank_gate_type == 'hard':
+        gate_soft = torch.sigmoid(
+            (float(rank_soft_gate_cutoff) - sigma) / float(rank_soft_gate_temp)
+        ).to(dtype=tr_pred.dtype)
+        teacher_active_graph_mask = None
+        if rank_prune_sigma_cutoff is not None:
+            teacher_active_graph_mask = sigma <= float(rank_prune_sigma_cutoff)
+        else:
+            teacher_active_graph_mask = gate_soft > float(rank_prune_eps)
+
+        if rank_weight > 0.0 and rank_gate_type == 'hard':
             # Historical hard-gate objective: prune inactive graphs and reduce
             # over active graphs inside the regularizer.
             sigma_cutoff = float(rank_sigma_gate_cutoff)
@@ -180,19 +214,12 @@ def loss_function(
                 sigma = sigma.expand_as(rank_loss)
             active = (sigma <= sigma_cutoff).to(torch.float32)
             rank_gate_mean = active.mean() if apply_mean else active
-        elif rank_gate_type in ('soft', 'soft_prune'):
+        elif rank_weight > 0.0 and rank_gate_type in ('soft', 'soft_prune'):
             # Soft objective: always apply the sigmoid gate outside the
             # regularizer and keep the full-batch mean reduction.
-            gate_soft = torch.sigmoid(
-                (float(rank_soft_gate_cutoff) - sigma) / float(rank_soft_gate_temp)
-            ).to(dtype=tr_pred.dtype)
-
             active_graph_mask = None
             if rank_gate_type == 'soft_prune':
-                if rank_prune_sigma_cutoff is not None:
-                    active_graph_mask = sigma <= float(rank_prune_sigma_cutoff)
-                else:
-                    active_graph_mask = gate_soft > float(rank_prune_eps)
+                active_graph_mask = teacher_active_graph_mask
 
             per_graph_rank_loss = low_rank_contact_loss(
                 data=data,
@@ -216,15 +243,74 @@ def loss_function(
             rank_loss = rank_loss_per_graph.mean() if apply_mean else rank_loss_per_graph
             rank_gate_mean = gate_soft.mean() if apply_mean else gate_soft
         else:
-            raise ValueError(f"Unknown rank_gate_type: {rank_gate_type}")
+            if rank_weight > 0.0:
+                raise ValueError(f"Unknown rank_gate_type: {rank_gate_type}")
 
-        loss = loss + rank_weight * rank_loss
+        if rank_weight > 0.0:
+            loss = loss + rank_weight * rank_loss
+
+        if rank_teacher_weight > 0.0:
+            teacher_tr, teacher_rot, _ = detached_rank_se3_teacher(
+                data=data,
+                tr_pred=tr_pred.to(pred_device),
+                rot_pred=rot_pred.to(pred_device),
+                tr_sigma=tr_sigma.to(pred_device),
+                gate=gate_soft,
+                active_graph_mask=teacher_active_graph_mask,
+                rank_mode=str(rank_mode),
+                rank_k=int(rank_k),
+                gaussian_sigma=float(rank_sigma),
+                alpha_tr=float(rank_alpha_tr),
+                alpha_rot=float(rank_alpha_rot),
+                use_receptor_atoms=True,
+                ensemble_samples=int(rank_ensemble_samples),
+                ensemble_translation_std=float(rank_ensemble_tr_std),
+                ensemble_rotation_std=float(rank_ensemble_rot_std),
+            )
+            if bool(rank_teacher_use_rot_sign_flip):
+                teacher_rot = -teacher_rot
+
+            tr_teacher_per_graph, tr_teacher_valid, tr_cos = _cosine_teacher_loss(
+                tr_pred.to(pred_device),
+                teacher_tr,
+                gate_soft,
+                rank_teacher_min_tr_norm,
+            )
+            rot_teacher_per_graph, rot_teacher_valid, rot_cos = _cosine_teacher_loss(
+                rot_pred.to(pred_device),
+                teacher_rot,
+                gate_soft,
+                rank_teacher_min_rot_norm,
+            )
+            rank_teacher_tr_loss = tr_teacher_per_graph.mean() if apply_mean else tr_teacher_per_graph
+            rank_teacher_rot_loss = rot_teacher_per_graph.mean() if apply_mean else rot_teacher_per_graph
+            rank_teacher_loss = (
+                float(rank_teacher_tr_weight) * rank_teacher_tr_loss
+                + float(rank_teacher_rot_weight) * rank_teacher_rot_loss
+            )
+            teacher_active = torch.maximum(tr_teacher_valid, rot_teacher_valid)
+            rank_teacher_active_mean = teacher_active.mean() if apply_mean else teacher_active
+            rank_teacher_tr_cos = tr_cos.mean() if apply_mean else tr_cos
+            rank_teacher_rot_cos = rot_cos.mean() if apply_mean else rot_cos
+            loss = loss + float(rank_teacher_weight) * rank_teacher_loss
 
     if not apply_mean:
         if rank_loss.numel() == 1 and score_loss.numel() > 1:
             rank_loss = rank_loss.expand_as(score_loss)
         if rank_gate_mean.numel() == 1 and score_loss.numel() > 1:
             rank_gate_mean = rank_gate_mean.expand_as(score_loss)
+        if rank_teacher_loss.numel() == 1 and score_loss.numel() > 1:
+            rank_teacher_loss = rank_teacher_loss.expand_as(score_loss)
+        if rank_teacher_tr_loss.numel() == 1 and score_loss.numel() > 1:
+            rank_teacher_tr_loss = rank_teacher_tr_loss.expand_as(score_loss)
+        if rank_teacher_rot_loss.numel() == 1 and score_loss.numel() > 1:
+            rank_teacher_rot_loss = rank_teacher_rot_loss.expand_as(score_loss)
+        if rank_teacher_active_mean.numel() == 1 and score_loss.numel() > 1:
+            rank_teacher_active_mean = rank_teacher_active_mean.expand_as(score_loss)
+        if rank_teacher_tr_cos.numel() == 1 and score_loss.numel() > 1:
+            rank_teacher_tr_cos = rank_teacher_tr_cos.expand_as(score_loss)
+        if rank_teacher_rot_cos.numel() == 1 and score_loss.numel() > 1:
+            rank_teacher_rot_cos = rank_teacher_rot_cos.expand_as(score_loss)
 
     return (
         loss,
@@ -234,6 +320,12 @@ def loss_function(
         tor_loss.detach(),
         rank_loss.detach(),
         rank_gate_mean.detach(),
+        rank_teacher_loss.detach(),
+        rank_teacher_tr_loss.detach(),
+        rank_teacher_rot_loss.detach(),
+        rank_teacher_active_mean.detach(),
+        rank_teacher_tr_cos.detach(),
+        rank_teacher_rot_cos.detach(),
         tr_base_loss,
         rot_base_loss,
         tor_base_loss,
@@ -283,6 +375,8 @@ class AverageMeter():
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1):
     model.train()
     meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
+                          'rank_teacher_loss', 'rank_teacher_tr_loss', 'rank_teacher_rot_loss',
+                          'rank_teacher_active_mean', 'rank_teacher_tr_cos', 'rank_teacher_rot_cos',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
     accum_count = 0
     optimizer.zero_grad(set_to_none=True)
@@ -384,12 +478,16 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
     meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
+                          'rank_teacher_loss', 'rank_teacher_tr_loss', 'rank_teacher_rot_loss',
+                          'rank_teacher_active_mean', 'rank_teacher_tr_cos', 'rank_teacher_rot_cos',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
             ['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
+             'rank_teacher_loss', 'rank_teacher_tr_loss', 'rank_teacher_rot_loss',
+             'rank_teacher_active_mean', 'rank_teacher_tr_cos', 'rank_teacher_rot_cos',
              'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
             unpooled_metrics=True, intervals=10)
 
@@ -436,6 +534,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 sigma_index_tor = torch.round(complex_t_tor.cpu() * (10 - 1)).long()
                 meter_all.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]],
                     [sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr,
+                     sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tr, sigma_index_tr, sigma_index_rot,
                      sigma_index_tr, sigma_index_rot, sigma_index_tor])
 
         except RuntimeError as e:
