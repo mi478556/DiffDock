@@ -22,6 +22,24 @@ from utils.training import train_epoch, test_epoch, loss_function, inference_epo
 from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage
 
 
+def _nested_tensors_are_finite(obj):
+    if torch.is_tensor(obj):
+        return (not obj.is_floating_point()) or torch.isfinite(obj).all().item()
+    if isinstance(obj, dict):
+        return all(_nested_tensors_are_finite(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return all(_nested_tensors_are_finite(v) for v in obj)
+    return True
+
+
+def _save_finite_state_dict(state_dict, path, label):
+    if not _nested_tensors_are_finite(state_dict):
+        print(f"Skipping {label} checkpoint save because model state contains non-finite values")
+        return False
+    torch.save(state_dict, path)
+    return True
+
+
 def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset2):
     best_val_loss = math.inf
     best_val_inference_value = math.inf if args.inference_earlystop_goal == 'min' else 0
@@ -56,16 +74,22 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                 'train_rank_teacher_loss', 'train_rank_teacher_contribution', 'train_rank_teacher_tr_loss',
                 'train_rank_teacher_rot_loss', 'train_rank_teacher_active_mean',
                 'train_rank_teacher_tr_cos', 'train_rank_teacher_rot_cos',
+                'train_rank_oracle_rot_loss', 'train_rank_oracle_rot_contribution',
+                'train_rank_oracle_rot_active_mean', 'train_rank_oracle_rot_cos',
+                'train_rank_oracle_rot_delta', 'train_rank_oracle_rot_energy_drop',
                 'val_score_loss', 'val_total_loss', 'val_tr_loss', 'val_rot_loss', 'val_tor_loss',
                 'val_rank_loss', 'val_rank_contribution', 'val_rank_gate_mean',
                 'val_rank_teacher_loss', 'val_rank_teacher_contribution', 'val_rank_teacher_tr_loss',
                 'val_rank_teacher_rot_loss', 'val_rank_teacher_active_mean',
                 'val_rank_teacher_tr_cos', 'val_rank_teacher_rot_cos',
+                'val_rank_oracle_rot_loss', 'val_rank_oracle_rot_contribution',
+                'val_rank_oracle_rot_active_mean', 'val_rank_oracle_rot_cos',
+                'val_rank_oracle_rot_delta', 'val_rank_oracle_rot_energy_drop',
                 'valinf_rmsds_lt2', 'valinf_rmsds_lt5', 'valinf_min_rmsds_lt2', 'valinf_min_rmsds_lt5',
                 'valinf2_rmsds_lt2', 'valinf2_rmsds_lt5', 'valinf2_min_rmsds_lt2', 'valinf2_min_rmsds_lt5',
                 'valinfcomb_rmsds_lt2', 'valinfcomb_rmsds_lt5',
                 'valinfcomb_min_rmsds_lt2', 'valinfcomb_min_rmsds_lt5',
-                'lr', 'rank_weight', 'timestamp',
+                'lr', 'rank_weight', 'rank_teacher_weight', 'rank_oracle_rot_weight', 'timestamp',
             ]
             csv_exists = os.path.exists(csv_path)
             csv_file = open(csv_path, 'a', newline='')
@@ -126,6 +150,28 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
             rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
             rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
+            rank_teacher_mode=getattr(args, 'rank_teacher_mode', None),
+            rank_oracle_rot_weight=args.rank_oracle_rot_weight,
+            rank_oracle_rot_mode=getattr(args, 'rank_oracle_rot_mode', None),
+            rank_oracle_rot_probe_eps=args.rank_oracle_rot_probe_eps,
+            rank_oracle_rot_sigma_min=args.rank_oracle_rot_sigma_min,
+            rank_oracle_rot_sigma_max=args.rank_oracle_rot_sigma_max,
+            rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
+            rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
+            rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
+            rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
+            rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
+        )
+        val_rank_weight = args.rank_weight if getattr(args, 'val_rank_weight', None) is None else args.val_rank_weight
+        val_rank_teacher_weight = (
+            args.rank_teacher_weight
+            if getattr(args, 'val_rank_teacher_weight', None) is None
+            else args.val_rank_teacher_weight
+        )
+        val_rank_oracle_rot_weight = (
+            args.rank_oracle_rot_weight
+            if getattr(args, 'val_rank_oracle_rot_weight', None) is None
+            else args.val_rank_oracle_rot_weight
         )
         val_loss_fn = functools.partial(
             loss_function,
@@ -133,7 +179,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rot_weight=1.0,
             tor_weight=1.0,
             no_torsion=args.no_torsion,
-            rank_weight=args.rank_weight,
+            rank_weight=val_rank_weight,
             rank_mode=args.rank_mode,
             rank_k=args.rank_k,
             rank_sigma=args.rank_sigma,
@@ -148,12 +194,23 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_soft_gate_temp=args.rank_soft_gate_temp,
             rank_prune_eps=args.rank_prune_eps,
             rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
-            rank_teacher_weight=args.rank_teacher_weight,
+            rank_teacher_weight=val_rank_teacher_weight,
             rank_teacher_tr_weight=args.rank_teacher_tr_weight,
             rank_teacher_rot_weight=args.rank_teacher_rot_weight,
             rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
             rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
             rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
+            rank_teacher_mode=getattr(args, 'rank_teacher_mode', None),
+            rank_oracle_rot_weight=val_rank_oracle_rot_weight,
+            rank_oracle_rot_mode=getattr(args, 'rank_oracle_rot_mode', None),
+            rank_oracle_rot_probe_eps=args.rank_oracle_rot_probe_eps,
+            rank_oracle_rot_sigma_min=args.rank_oracle_rot_sigma_min,
+            rank_oracle_rot_sigma_max=args.rank_oracle_rot_sigma_max,
+            rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
+            rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
+            rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
+            rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
+            rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
         )
         train_losses = train_epoch(
             model,
@@ -164,6 +221,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             train_loss_fn,
             ema_weights if epoch > freeze_params else None,
             grad_accum_steps=args.grad_accum_steps,
+            max_grad_norm=args.max_grad_norm,
         )
         print("Epoch {}: Training score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['score_loss'], train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
@@ -172,6 +230,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
               .format(epoch, train_losses.get('rank_teacher_loss', 0.0), train_losses.get('rank_teacher_tr_loss', 0.0),
                       train_losses.get('rank_teacher_rot_loss', 0.0), train_losses.get('rank_teacher_active_mean', 0.0),
                       train_losses.get('rank_teacher_tr_cos', 0.0), train_losses.get('rank_teacher_rot_cos', 0.0)))
+        print("Epoch {}: Training oracle_rot {:.4f}  active {:.4f}  target_cos {:.4f}  delta {:.4f}  energy_drop {:.4f}"
+              .format(epoch, train_losses.get('rank_oracle_rot_loss', 0.0), train_losses.get('rank_oracle_rot_active_mean', 0.0),
+                      train_losses.get('rank_oracle_rot_cos', 0.0), train_losses.get('rank_oracle_rot_delta', 0.0),
+                      train_losses.get('rank_oracle_rot_energy_drop', 0.0)))
 
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
@@ -183,6 +245,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
               .format(epoch, val_losses.get('rank_teacher_loss', 0.0), val_losses.get('rank_teacher_tr_loss', 0.0),
                       val_losses.get('rank_teacher_rot_loss', 0.0), val_losses.get('rank_teacher_active_mean', 0.0),
                       val_losses.get('rank_teacher_tr_cos', 0.0), val_losses.get('rank_teacher_rot_cos', 0.0)))
+        print("Epoch {}: Validation oracle_rot {:.4f}  active {:.4f}  target_cos {:.4f}  delta {:.4f}  energy_drop {:.4f}"
+              .format(epoch, val_losses.get('rank_oracle_rot_loss', 0.0), val_losses.get('rank_oracle_rot_active_mean', 0.0),
+                      val_losses.get('rank_oracle_rot_cos', 0.0), val_losses.get('rank_oracle_rot_delta', 0.0),
+                      val_losses.get('rank_oracle_rot_energy_drop', 0.0)))
         val_selection_loss = val_losses.get('score_loss', val_losses['loss'])
 
         if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
@@ -223,29 +289,46 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             wandb.log(logs, step=epoch + 1)
 
         # Be robust whether the model is wrapped (has attribute 'module') or not.
-        state_dict = getattr(model, 'module', model).state_dict()
+        # Deep-copy before saving so a later bad optimizer step cannot poison a
+        # previously selected best checkpoint through live tensor references.
+        state_dict = copy.deepcopy(getattr(model, 'module', model).state_dict())
         if args.inference_earlystop_metric in logs.keys() and \
                 (args.inference_earlystop_goal == 'min' and logs[args.inference_earlystop_metric] <= best_val_inference_value or
                  args.inference_earlystop_goal == 'max' and logs[args.inference_earlystop_metric] >= best_val_inference_value):
-            best_val_inference_value = logs[args.inference_earlystop_metric]
-            best_val_inference_epoch = epoch
-            torch.save(state_dict, os.path.join(run_dir, 'best_inference_epoch_model.pt'))
-            if epoch > freeze_params:
-                torch.save(ema_state_dict, os.path.join(run_dir, 'best_ema_inference_epoch_model.pt'))
+            saved_best_inference = _save_finite_state_dict(
+                state_dict,
+                os.path.join(run_dir, 'best_inference_epoch_model.pt'),
+                'best inference',
+            )
+            if saved_best_inference:
+                best_val_inference_value = logs[args.inference_earlystop_metric]
+                best_val_inference_epoch = epoch
+            if saved_best_inference and epoch > freeze_params:
+                _save_finite_state_dict(ema_state_dict, os.path.join(run_dir, 'best_ema_inference_epoch_model.pt'), 'best EMA inference')
 
         if args.inference_secondary_metric is not None and args.inference_secondary_metric in logs.keys() and \
                 (args.inference_earlystop_goal == 'min' and logs[args.inference_secondary_metric] <= best_val_secondary_value or
                  args.inference_earlystop_goal == 'max' and logs[args.inference_secondary_metric] >= best_val_secondary_value):
-            best_val_secondary_value = logs[args.inference_secondary_metric]
             if epoch > freeze_params:
-                torch.save(ema_state_dict, os.path.join(run_dir, 'best_ema_secondary_epoch_model.pt'))
+                saved_secondary = _save_finite_state_dict(
+                    ema_state_dict,
+                    os.path.join(run_dir, 'best_ema_secondary_epoch_model.pt'),
+                    'best EMA secondary',
+                )
+                if saved_secondary:
+                    best_val_secondary_value = logs[args.inference_secondary_metric]
 
         if val_selection_loss <= best_val_loss:
-            best_val_loss = val_selection_loss
-            best_epoch = epoch
-            torch.save(state_dict, os.path.join(run_dir, 'best_model.pt'))
-            if epoch > freeze_params:
-                torch.save(ema_state_dict, os.path.join(run_dir, 'best_ema_model.pt'))
+            saved_best_validation = _save_finite_state_dict(
+                state_dict,
+                os.path.join(run_dir, 'best_model.pt'),
+                'best validation',
+            )
+            if saved_best_validation:
+                best_val_loss = val_selection_loss
+                best_epoch = epoch
+            if saved_best_validation and epoch > freeze_params:
+                _save_finite_state_dict(ema_state_dict, os.path.join(run_dir, 'best_ema_model.pt'), 'best EMA validation')
 
         if args.save_model_freq is not None and (epoch + 1) % args.save_model_freq == 0:
             shutil.copyfile(os.path.join(run_dir, 'best_model.pt'),
@@ -259,12 +342,16 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             else:
                 scheduler.step(val_selection_loss)
 
-        torch.save({
+        last_checkpoint = {
             'epoch': epoch,
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
             'ema_weights': ema_weights.state_dict(),
-        }, os.path.join(run_dir, 'last_model.pt'))
+        }
+        if _nested_tensors_are_finite(last_checkpoint):
+            torch.save(last_checkpoint, os.path.join(run_dir, 'last_model.pt'))
+        else:
+            print("Skipping last_model checkpoint save because checkpoint state contains non-finite values")
 
         # Optional per-epoch logging: write CSV row and TensorBoard scalars when enabled
         if csv_writer is not None:
@@ -275,7 +362,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     if isinstance(train_losses, dict) and train_losses.get('rank_loss') is not None else None
                 )
                 val_rank_contribution = (
-                    args.rank_weight * val_losses.get('rank_loss')
+                    val_rank_weight * val_losses.get('rank_loss')
                     if isinstance(val_losses, dict) and val_losses.get('rank_loss') is not None else None
                 )
                 train_rank_teacher_contribution = (
@@ -283,8 +370,16 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     if isinstance(train_losses, dict) and train_losses.get('rank_teacher_loss') is not None else None
                 )
                 val_rank_teacher_contribution = (
-                    args.rank_teacher_weight * val_losses.get('rank_teacher_loss')
+                    val_rank_teacher_weight * val_losses.get('rank_teacher_loss')
                     if isinstance(val_losses, dict) and val_losses.get('rank_teacher_loss') is not None else None
+                )
+                train_rank_oracle_rot_contribution = (
+                    args.rank_oracle_rot_weight * train_losses.get('rank_oracle_rot_loss')
+                    if isinstance(train_losses, dict) and train_losses.get('rank_oracle_rot_loss') is not None else None
+                )
+                val_rank_oracle_rot_contribution = (
+                    val_rank_oracle_rot_weight * val_losses.get('rank_oracle_rot_loss')
+                    if isinstance(val_losses, dict) and val_losses.get('rank_oracle_rot_loss') is not None else None
                 )
 
                 csv_writer.writerow([
@@ -304,6 +399,12 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     train_losses.get('rank_teacher_active_mean') if isinstance(train_losses, dict) else None,
                     train_losses.get('rank_teacher_tr_cos') if isinstance(train_losses, dict) else None,
                     train_losses.get('rank_teacher_rot_cos') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_oracle_rot_loss') if isinstance(train_losses, dict) else None,
+                    train_rank_oracle_rot_contribution,
+                    train_losses.get('rank_oracle_rot_active_mean') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_oracle_rot_cos') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_oracle_rot_delta') if isinstance(train_losses, dict) else None,
+                    train_losses.get('rank_oracle_rot_energy_drop') if isinstance(train_losses, dict) else None,
                     val_losses.get('score_loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('loss') if isinstance(val_losses, dict) else None,
                     val_losses.get('tr_loss') if isinstance(val_losses, dict) else None,
@@ -319,6 +420,12 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     val_losses.get('rank_teacher_active_mean') if isinstance(val_losses, dict) else None,
                     val_losses.get('rank_teacher_tr_cos') if isinstance(val_losses, dict) else None,
                     val_losses.get('rank_teacher_rot_cos') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_oracle_rot_loss') if isinstance(val_losses, dict) else None,
+                    val_rank_oracle_rot_contribution,
+                    val_losses.get('rank_oracle_rot_active_mean') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_oracle_rot_cos') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_oracle_rot_delta') if isinstance(val_losses, dict) else None,
+                    val_losses.get('rank_oracle_rot_energy_drop') if isinstance(val_losses, dict) else None,
                     logs.get('valinf_rmsds_lt2'),
                     logs.get('valinf_rmsds_lt5'),
                     logs.get('valinf_min_rmsds_lt2'),
@@ -333,6 +440,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     logs.get('valinfcomb_min_rmsds_lt5'),
                     current_lr,
                     args.rank_weight,
+                    args.rank_teacher_weight,
+                    args.rank_oracle_rot_weight,
                     time.time()
                 ])
                 csv_file.flush()
@@ -354,12 +463,18 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                         tb_writer.add_scalar('train/rank_teacher_contribution', train_rank_teacher_contribution, epoch)
                     if val_rank_teacher_contribution is not None:
                         tb_writer.add_scalar('val/rank_teacher_contribution', val_rank_teacher_contribution, epoch)
+                    if train_rank_oracle_rot_contribution is not None:
+                        tb_writer.add_scalar('train/rank_oracle_rot_contribution', train_rank_oracle_rot_contribution, epoch)
+                    if val_rank_oracle_rot_contribution is not None:
+                        tb_writer.add_scalar('val/rank_oracle_rot_contribution', val_rank_oracle_rot_contribution, epoch)
                     for metric_key, metric_value in logs.items():
                         if metric_key.startswith(('valinf_', 'valinf2_', 'valinfcomb_', 'traininf_')):
                             tb_writer.add_scalar(metric_key.replace('_', '/', 1), metric_value, epoch)
                     if current_lr is not None:
                         tb_writer.add_scalar('train/lr', current_lr, epoch)
                     tb_writer.add_scalar('train/rank_weight', args.rank_weight, epoch)
+                    tb_writer.add_scalar('train/rank_teacher_weight', args.rank_teacher_weight, epoch)
+                    tb_writer.add_scalar('train/rank_oracle_rot_weight', args.rank_oracle_rot_weight, epoch)
                     if isinstance(train_losses, dict) and train_losses.get('rank_gate_mean') is not None:
                         tb_writer.add_scalar('train/rank_gate_mean', train_losses.get('rank_gate_mean'), epoch)
                     if isinstance(val_losses, dict) and val_losses.get('rank_gate_mean') is not None:
@@ -367,13 +482,17 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                     if isinstance(train_losses, dict):
                         for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_teacher_loss',
                                   'rank_teacher_tr_loss', 'rank_teacher_rot_loss', 'rank_teacher_active_mean',
-                                  'rank_teacher_tr_cos', 'rank_teacher_rot_cos']:
+                                  'rank_teacher_tr_cos', 'rank_teacher_rot_cos',
+                                  'rank_oracle_rot_loss', 'rank_oracle_rot_active_mean', 'rank_oracle_rot_cos',
+                                  'rank_oracle_rot_delta', 'rank_oracle_rot_energy_drop']:
                             if train_losses.get(k) is not None:
                                 tb_writer.add_scalar(f'train/{k}', train_losses.get(k), epoch)
                     if isinstance(val_losses, dict):
                         for k in ['tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_teacher_loss',
                                   'rank_teacher_tr_loss', 'rank_teacher_rot_loss', 'rank_teacher_active_mean',
-                                  'rank_teacher_tr_cos', 'rank_teacher_rot_cos']:
+                                  'rank_teacher_tr_cos', 'rank_teacher_rot_cos',
+                                  'rank_oracle_rot_loss', 'rank_oracle_rot_active_mean', 'rank_oracle_rot_cos',
+                                  'rank_oracle_rot_delta', 'rank_oracle_rot_energy_drop']:
                             if val_losses.get(k) is not None:
                                 tb_writer.add_scalar(f'val/{k}', val_losses.get(k), epoch)
                     tb_writer.flush()

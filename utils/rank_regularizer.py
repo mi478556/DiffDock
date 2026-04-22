@@ -121,9 +121,18 @@ def _frobenius_tail_energy_from_svals(svals: Tensor, k: int) -> Tensor:
     return torch.sum(tail * tail)
 
 
-def _tail_energy_from_contact_matrix(M: Tensor, rank_k: int, normalize: bool = True) -> Tensor:
+def _zero_connected_to_matrix(M: Tensor) -> Tensor:
+    """Return differentiable zero tied to M so failed rank terms give zero grad."""
+    return M.sum() * 0.0
+
+
+def _frobenius_tail_energy_from_matrix(M: Tensor, rank_k: int) -> Tensor:
     svals = torch.linalg.svdvals(M)
-    tail_energy = _frobenius_tail_energy_from_svals(svals, rank_k)
+    return _frobenius_tail_energy_from_svals(svals, rank_k)
+
+
+def _tail_energy_from_contact_matrix(M: Tensor, rank_k: int, normalize: bool = True) -> Tensor:
+    tail_energy = _frobenius_tail_energy_from_matrix(M, rank_k)
     if normalize:
         return tail_energy / M.numel()
     return tail_energy
@@ -319,7 +328,6 @@ def detached_rank_se3_teacher(
     tr_pred: Tensor,
     rot_pred: Tensor,
     tr_sigma: Tensor,
-    gate: Tensor,
     active_graph_mask: Optional[Tensor] = None,
     rank_mode: str = 'single',
     rank_k: int = 8,
@@ -339,7 +347,6 @@ def detached_rank_se3_teacher(
     """
     device = tr_pred.device
     B = _num_graphs(data)
-    gate = _normalize_graph_vector(gate.to(device), B, "gate").to(dtype=tr_pred.dtype)
     if active_graph_mask is not None:
         active_graph_mask = _normalize_graph_vector(active_graph_mask.to(device).bool(), B, "active_graph_mask")
 
@@ -375,14 +382,182 @@ def detached_rank_se3_teacher(
             ensemble_translation_std=ensemble_translation_std,
             ensemble_rotation_std=ensemble_rotation_std,
         )
-        weighted_energy = (gate.to(dtype=rank_energy.dtype) * rank_energy).sum()
-        if weighted_energy.requires_grad:
-            grad = torch.autograd.grad(weighted_energy, probe_pos, retain_graph=False, create_graph=False)[0]
+        # Build the teacher from the ungated rank landscape so the teacher
+        # geometry is independent from any gating/trust variables.
+        teacher_energy = rank_energy.sum()
+        if teacher_energy.requires_grad:
+            grad = torch.autograd.grad(teacher_energy, probe_pos, retain_graph=False, create_graph=False)[0]
         else:
             grad = torch.zeros_like(probe_pos)
 
     teacher_tr, teacher_rot = project_ligand_gradient_to_se3(data, probe_pos.detach(), grad.detach())
     return teacher_tr.detach(), teacher_rot.detach(), rank_energy.detach()
+
+
+def _signed_axis_rotation_candidates(device, dtype) -> Tensor:
+    axes = torch.eye(3, device=device, dtype=dtype)
+    return torch.cat([axes, -axes], dim=0)
+
+
+def _perturb_ligand_positions_by_graph_rotation(
+    data,
+    lig_pos: Tensor,
+    graph_rot_vec: Tensor,
+    eps: float,
+) -> Tensor:
+    B = _num_graphs(data)
+    lig_batch = _make_batch_index(data, 'ligand').to(lig_pos.device)
+    zeros = graph_rot_vec.new_zeros((B, 3))
+    zero_step = graph_rot_vec.new_zeros((B,))
+    rot_step = graph_rot_vec.new_full((B,), float(eps))
+    return _apply_one_step_se3(lig_pos, lig_batch, zeros, graph_rot_vec, zero_step, rot_step)
+
+
+def target_conditioned_rank_oracle_rot_teacher(
+    data,
+    tr_pred: Tensor,
+    rot_pred: Tensor,
+    rot_score: Tensor,
+    tr_sigma: Tensor,
+    active_graph_mask: Optional[Tensor] = None,
+    rank_mode: str = 'single',
+    rank_k: int = 8,
+    gaussian_sigma: float = 2.0,
+    alpha_tr: float = 0.25,
+    alpha_rot: float = 0.25,
+    probe_eps: float = 0.05,
+    sigma_min: float = 2.0,
+    sigma_max: float = 3.0,
+    min_delta: float = 0.05,
+    min_cos: float = 0.0,
+    min_energy_drop: float = 0.0,
+    require_energy_drop: bool = True,
+    use_receptor_atoms: bool = True,
+    ensemble_samples: int = 4,
+    ensemble_translation_std: float = 0.5,
+    ensemble_rotation_std: float = 0.15,
+):
+    """
+    Build a detached target-conditioned rank-probe rotation teacher.
+
+    This is a supervised training auxiliary, not a rank-only teacher. The rank
+    energy supplies signed rotation-axis candidates, and the known training
+    rot_score chooses the rank-supported candidate that is useful. At inference
+    or validation with the auxiliary disabled, none of this path is used.
+    """
+    device = rot_pred.device
+    dtype = rot_pred.dtype
+    B = _num_graphs(data)
+    sigma = _normalize_graph_vector(tr_sigma.to(device), B, "tr_sigma")
+    if active_graph_mask is None:
+        active_graph_mask = torch.ones(B, device=device, dtype=torch.bool)
+    else:
+        active_graph_mask = _normalize_graph_vector(active_graph_mask.to(device).bool(), B, "active_graph_mask")
+
+    sigma_mask = (sigma >= float(sigma_min)) & (sigma <= float(sigma_max))
+    contribution_mask = active_graph_mask & sigma_mask
+
+    teacher = rot_pred.new_zeros((B, 3))
+    active = torch.zeros(B, device=device, dtype=torch.bool)
+    best_cos_out = rot_pred.new_zeros((B,))
+    best_delta_out = rot_pred.new_zeros((B,))
+    best_energy_drop_out = rot_pred.new_zeros((B,))
+
+    if int(contribution_mask.sum().item()) == 0:
+        return teacher, active, best_cos_out, best_delta_out, best_energy_drop_out
+
+    with torch.no_grad():
+        lig_pos_t = _stack_graph_field(data, 'ligand', 'pos').to(device)
+        lig_batch = _make_batch_index(data, 'ligand').to(device)
+        step_tr = float(alpha_tr) * sigma.clamp_min(1e-3)
+        step_rot = torch.full((B,), float(alpha_rot), device=device, dtype=dtype)
+        base_pos = _apply_one_step_se3(
+            lig_pos_t,
+            lig_batch,
+            tr_pred.detach(),
+            rot_pred.detach(),
+            step_tr.to(dtype=dtype),
+            step_rot,
+        )
+        e0 = rank_energy_per_graph_from_ligand_positions(
+            data=data,
+            lig_pos=base_pos,
+            rank_mode=rank_mode,
+            rank_k=rank_k,
+            gaussian_sigma=gaussian_sigma,
+            use_receptor_atoms=use_receptor_atoms,
+            active_graph_mask=contribution_mask,
+            ensemble_samples=ensemble_samples,
+            ensemble_translation_std=ensemble_translation_std,
+            ensemble_rotation_std=ensemble_rotation_std,
+        )
+
+        candidate_dirs = _signed_axis_rotation_candidates(device, dtype)
+        candidate_energy = []
+        for direction in candidate_dirs:
+            graph_vec = direction.view(1, 3).expand(B, 3)
+            probe_pos = _perturb_ligand_positions_by_graph_rotation(
+                data,
+                base_pos,
+                graph_vec,
+                eps=float(probe_eps),
+            )
+            candidate_energy.append(rank_energy_per_graph_from_ligand_positions(
+                data=data,
+                lig_pos=probe_pos,
+                rank_mode=rank_mode,
+                rank_k=rank_k,
+                gaussian_sigma=gaussian_sigma,
+                use_receptor_atoms=use_receptor_atoms,
+                active_graph_mask=contribution_mask,
+                ensemble_samples=ensemble_samples,
+                ensemble_translation_std=ensemble_translation_std,
+                ensemble_rotation_std=ensemble_rotation_std,
+            ))
+        candidate_energy = torch.stack(candidate_energy, dim=1)
+        energy_drop = e0.unsqueeze(1) - candidate_energy
+
+        rot_score_f = rot_score.detach().to(device=device, dtype=dtype)
+        score_norm = torch.linalg.vector_norm(rot_score_f, dim=-1, keepdim=True).clamp_min(1e-12)
+        score_unit = rot_score_f / score_norm
+        candidate_cos = candidate_dirs @ score_unit.T
+        candidate_cos = candidate_cos.T
+
+        if require_energy_drop:
+            rank_supported = energy_drop > float(min_energy_drop)
+        else:
+            rank_supported = torch.isfinite(energy_drop)
+            if float(min_energy_drop) > 0.0:
+                rank_supported = rank_supported & (energy_drop > float(min_energy_drop))
+
+        candidate_value = torch.where(
+            rank_supported & contribution_mask.unsqueeze(1),
+            candidate_cos,
+            torch.full_like(candidate_cos, -1.0e6),
+        )
+        best_cos, best_idx = candidate_value.max(dim=1)
+        best_dir = candidate_dirs[best_idx]
+        best_drop = energy_drop.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
+        pred_norm = torch.linalg.vector_norm(rot_pred.detach().to(dtype=dtype), dim=-1).clamp_min(1e-12)
+        pred_cos = (rot_pred.detach().to(dtype=dtype) * rot_score_f).sum(dim=-1) / (pred_norm * score_norm.squeeze(1))
+        best_delta = best_cos - pred_cos
+
+        valid = (
+            contribution_mask
+            & torch.isfinite(best_cos)
+            & torch.isfinite(best_delta)
+            & (best_cos > -1.0e5)
+            & (best_cos >= float(min_cos))
+            & (best_delta >= float(min_delta))
+        )
+        teacher = torch.where(valid.unsqueeze(1), best_dir, torch.zeros_like(best_dir))
+        active = valid
+        best_cos_out = torch.where(valid, best_cos, torch.zeros_like(best_cos))
+        best_delta_out = torch.where(valid, best_delta, torch.zeros_like(best_delta))
+        best_energy_drop_out = torch.where(valid, best_drop, torch.zeros_like(best_drop))
+
+    return teacher.detach(), active.detach(), best_cos_out.detach(), best_delta_out.detach(), best_energy_drop_out.detach()
 
 
 def _build_contact_matrices_from_ligand_positions(
@@ -458,7 +633,7 @@ def stacked_soft_clash_penalty(
             clash_power=clash_power,
         ))
     if len(penalties) == 0:
-        return distance_list[0].new_tensor(float('nan'))
+        return distance_list[0].sum() * 0.0
     stacked_penalties = torch.stack(penalties)
     if normalize_over_matrices:
         return torch.mean(stacked_penalties)
@@ -574,10 +749,9 @@ def low_rank_contact_loss(
             continue
         single_terms.append(_tail_energy_from_contact_matrix(M, rank_k=rank_k, normalize=True))
     single_per_graph = torch.stack(single_terms) if len(single_terms) > 0 else lig_pos_hat.new_zeros((B,))
-    if active_graph_weight is None:
-        single_loss = single_per_graph.mean()
-    else:
-        single_loss = (single_per_graph * active_graph_weight).sum() / active_graph_weight.sum().clamp_min(1.0)
+    if active_graph_weight is not None:
+        single_per_graph = single_per_graph * active_graph_weight
+    single_loss = single_per_graph.mean()
 
     if rank_mode == 'single':
         return single_per_graph if return_per_graph else single_loss
@@ -610,10 +784,9 @@ def low_rank_contact_loss(
             continue
         ensemble_terms.append(stacked_low_rank_tail_energy(matrix_list, rank_k=rank_k, normalize=False))
     ensemble_per_graph_terms = torch.stack(ensemble_terms) if len(ensemble_terms) > 0 else lig_pos_hat.new_zeros((B,))
-    if active_graph_weight is None:
-        ensemble_loss = ensemble_per_graph_terms.mean()
-    else:
-        ensemble_loss = (ensemble_per_graph_terms * active_graph_weight).sum() / active_graph_weight.sum().clamp_min(1.0)
+    if active_graph_weight is not None:
+        ensemble_per_graph_terms = ensemble_per_graph_terms * active_graph_weight
+    ensemble_loss = ensemble_per_graph_terms.mean()
 
     if rank_mode == 'ensemble':
         return ensemble_per_graph_terms if return_per_graph else ensemble_loss
@@ -621,9 +794,7 @@ def low_rank_contact_loss(
         fusion_per_graph = torch.log1p(single_per_graph) + torch.log1p(ensemble_per_graph_terms)
         if return_per_graph:
             return fusion_per_graph
-        if active_graph_weight is None:
-            return fusion_per_graph.mean()
-        return (fusion_per_graph * active_graph_weight).sum() / active_graph_weight.sum().clamp_min(1.0)
+        return fusion_per_graph.mean()
 
     raise ValueError(f'Unknown rank_mode: {rank_mode}')
 

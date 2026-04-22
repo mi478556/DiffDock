@@ -36,6 +36,7 @@ def parse_train_args():
     parser.add_argument('--num_dataloader_workers', type=int, default=0, help='Number of workers for dataloader')
     parser.add_argument('--pin_memory', action='store_true', default=False, help='pin_memory arg of dataloader')
     parser.add_argument('--dataloader_drop_last', action='store_true', default=False, help='drop_last arg of dataloader')
+    parser.add_argument('--max_grad_norm', type=float, default=None, help='Optional gradient clipping norm; non-finite clipped norms skip the optimizer step')
     parser.add_argument('--double_val', action='store_true', default=False, help='')
     parser.add_argument('--combined_training', action='store_true', default=False, help='')
 
@@ -141,6 +142,7 @@ def parse_train_args():
 
     #low rank
     parser.add_argument("--rank_weight", type=float, default=0.0)
+    parser.add_argument("--val_rank_weight", type=float, default=None)
     parser.add_argument("--rank_mode", type=str, default='single')
     parser.add_argument("--rank_k", type=int, default=8)
     parser.add_argument("--rank_sigma", type=float, default=2.0)
@@ -157,11 +159,26 @@ def parse_train_args():
     parser.add_argument("--rank_prune_eps", type=float, default=0.02)
     parser.add_argument("--rank_prune_sigma_cutoff", type=float, default=None)
     parser.add_argument("--rank_teacher_weight", type=float, default=0.0)
+    parser.add_argument("--val_rank_teacher_weight", type=float, default=None)
     parser.add_argument("--rank_teacher_tr_weight", type=float, default=1.0)
     parser.add_argument("--rank_teacher_rot_weight", type=float, default=1.0)
     parser.add_argument("--rank_teacher_min_tr_norm", type=float, default=1e-6)
     parser.add_argument("--rank_teacher_min_rot_norm", type=float, default=1e-6)
+    parser.add_argument("--rank_teacher_pred_norm_eps", type=float, default=1e-3)
     parser.add_argument("--rank_teacher_use_rot_sign_flip", action='store_true', default=False)
+    parser.add_argument("--rank_teacher_mode", type=str, default=None,
+                        choices=[None, 'single', 'ensemble', 'fusion_log1p_sum'])
+    parser.add_argument("--rank_oracle_rot_weight", type=float, default=0.0)
+    parser.add_argument("--val_rank_oracle_rot_weight", type=float, default=None)
+    parser.add_argument("--rank_oracle_rot_mode", type=str, default=None,
+                        choices=[None, 'single', 'ensemble', 'fusion_log1p_sum'])
+    parser.add_argument("--rank_oracle_rot_probe_eps", type=float, default=0.05)
+    parser.add_argument("--rank_oracle_rot_sigma_min", type=float, default=2.0)
+    parser.add_argument("--rank_oracle_rot_sigma_max", type=float, default=3.0)
+    parser.add_argument("--rank_oracle_rot_min_delta", type=float, default=0.05)
+    parser.add_argument("--rank_oracle_rot_min_cos", type=float, default=0.0)
+    parser.add_argument("--rank_oracle_rot_min_energy_drop", type=float, default=0.0)
+    parser.add_argument("--rank_oracle_rot_require_energy_drop", action='store_true', default=True)
 
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')
