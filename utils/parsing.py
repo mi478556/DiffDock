@@ -179,6 +179,13 @@ def parse_train_args():
     parser.add_argument("--rank_oracle_rot_min_cos", type=float, default=0.0)
     parser.add_argument("--rank_oracle_rot_min_energy_drop", type=float, default=0.0)
     parser.add_argument("--rank_oracle_rot_require_energy_drop", action='store_true', default=True)
+    parser.add_argument("--rank_oracle_rot_dynamic_weight", action='store_true', default=False)
+    parser.add_argument("--rank_oracle_rot_dynamic_target_ratio", type=float, default=1.0)
+    parser.add_argument("--rank_oracle_rot_dynamic_ema_beta", type=float, default=0.9)
+    parser.add_argument("--rank_oracle_rot_dynamic_weight_min", type=float, default=None)
+    parser.add_argument("--rank_oracle_rot_dynamic_weight_max", type=float, default=None)
+    parser.add_argument("--rank_oracle_rot_dynamic_max_rel_change", type=float, default=None)
+    parser.add_argument("--rank_oracle_rot_dynamic_eps", type=float, default=1e-6)
 
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')
