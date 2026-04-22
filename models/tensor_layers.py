@@ -14,6 +14,14 @@ from torch_scatter import scatter, scatter_mean
 from models.layers import FCBlock
 
 
+def _nodewise_rms_normalize(x: torch.Tensor, eps: float = 1e-6):
+    if x.numel() == 0:
+        return x
+    row_rms = torch.sqrt(torch.mean(x.float().pow(2), dim=-1, keepdim=True) + eps).to(x.dtype)
+    target = torch.mean(row_rms.float()).to(x.dtype)
+    return x / row_rms.clamp_min(torch.finfo(x.dtype).eps) * target
+
+
 def get_irrep_seq(ns, nv, use_second_order_repr, reduce_pseudoscalars):
     if use_second_order_repr:
         irrep_seq = [
@@ -123,7 +131,7 @@ class FasterTensorProduct(torch.nn.Module):
 
 
 def tp_scatter_simple(tp, fc_layer, node_attr, edge_index, edge_attr, edge_sh,
-                      out_nodes=None, reduce='mean', edge_weight=1.0):
+                      out_nodes=None, reduce='mean', edge_weight=1.0, degree_prescale=False):
     """
     Perform TensorProduct + scatter operation, aka graph convolution.
 
@@ -140,6 +148,10 @@ def tp_scatter_simple(tp, fc_layer, node_attr, edge_index, edge_attr, edge_sh,
     out_irreps = fc_layer(edge_attr).to(_device).to(_dtype)
     out_irreps.mul_(edge_weight)
     tp = tp(node_attr[edge_dst], edge_sh, out_irreps)
+    if degree_prescale:
+        out_nodes_eff = out_nodes or node_attr.shape[0]
+        deg = torch.bincount(edge_src, minlength=out_nodes_eff).to(dtype=_dtype, device=_device).clamp_min(1).rsqrt()
+        tp = tp * deg[edge_src].unsqueeze(-1)
     out_nodes = out_nodes or node_attr.shape[0]
     out = scatter(tp, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
     return out
@@ -148,7 +160,8 @@ def tp_scatter_simple(tp, fc_layer, node_attr, edge_index, edge_attr, edge_sh,
 def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.ModuleList],
                           node_attr: torch.Tensor, edge_index: torch.Tensor,
                           edge_attr_groups: List[torch.Tensor], edge_sh: torch.Tensor,
-                          out_nodes=None, reduce='mean', edge_weight=1.0):
+                          out_nodes=None, reduce='mean', edge_weight=1.0,
+                          degree_prescale=False, group_balance=False):
     """
     Perform TensorProduct + scatter operation, aka graph convolution.
 
@@ -199,6 +212,16 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
     total_output_dim = sum([x.dim for x in tp.irreps_out])
     final_out = torch.zeros((out_nodes, total_output_dim), device=_device, dtype=_dtype)
     div_factors = torch.zeros(out_nodes, device=_device, dtype=_dtype)
+    raw_group_outputs = []
+
+    if group_balance:
+        for ii in range(num_edge_groups):
+            cur_fc = fc_layer[ii] if isinstance(fc_layer, nn.ModuleList) else fc_layer
+            raw_group_outputs.append(cur_fc(edge_attr_groups[ii]).to(_device).to(_dtype))
+        group_rms = [torch.sqrt(torch.mean(g.float().pow(2)) + 1e-6).to(_dtype) for g in raw_group_outputs]
+        target_rms = torch.stack(group_rms).float().mean().to(_dtype)
+    else:
+        raw_group_outputs = [None] * num_edge_groups
 
     cur_start = 0
     for ii in range(num_edge_groups):
@@ -208,13 +231,21 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
         cur_edge_src, cur_edge_dst = edge_src[cur_edge_range], edge_dst[cur_edge_range]
 
         cur_fc = fc_layer[ii] if isinstance(fc_layer, nn.ModuleList) else fc_layer
-        cur_out_irreps = cur_fc(edge_attr_groups[ii])
+        cur_out_irreps = raw_group_outputs[ii]
+        if cur_out_irreps is None:
+            cur_out_irreps = cur_fc(edge_attr_groups[ii]).to(_device).to(_dtype)
+        elif group_balance:
+            cur_rms = torch.sqrt(torch.mean(cur_out_irreps.float().pow(2)) + 1e-6).to(_dtype)
+            cur_out_irreps = cur_out_irreps * (target_rms / cur_rms.clamp_min(torch.finfo(_dtype).eps))
         if edge_weight_is_indexable:
             cur_out_irreps.mul_(edge_weight[cur_edge_range])
         else:
             cur_out_irreps.mul_(edge_weight)
 
         summand = tp(node_attr[cur_edge_dst, :], edge_sh[cur_edge_range, :], cur_out_irreps)
+        if degree_prescale:
+            deg = torch.bincount(cur_edge_src, minlength=out_nodes).to(dtype=_dtype, device=_device).clamp_min(1).rsqrt()
+            summand = summand * deg[cur_edge_src].unsqueeze(-1)
         # We take a simple sum, and then add up the count of edges which contribute,
         # so that we can take the mean later.
         final_out += scatter(summand, cur_edge_src, dim=0, dim_size=out_nodes, reduce="sum")
@@ -242,6 +273,9 @@ class TensorProductConvLayer(torch.nn.Module):
         self.edge_groups = edge_groups
         self.out_size = irrep_to_size(out_irreps)
         self.depthwise = depthwise
+        self.tp_probe_message_norm = 'none'
+        self.tp_probe_degree_prescale = False
+        self.tp_probe_group_balance = False
         if hidden_features is None:
             hidden_features = n_edge_features
 
@@ -316,13 +350,19 @@ class TensorProductConvLayer(torch.nn.Module):
         else:
             if self.edge_groups == 1:
                 out = tp_scatter_simple(self.tp, self.fc, node_attr, edge_index, edge_attr, edge_sh,
-                                        out_nodes, reduce, edge_weight)
+                                        out_nodes, reduce, edge_weight,
+                                        degree_prescale=self.tp_probe_degree_prescale)
             else:
                 out = tp_scatter_multigroup(self.tp, self.fc, node_attr, edge_index, edge_attr, edge_sh,
-                                            out_nodes, reduce, edge_weight)
+                                            out_nodes, reduce, edge_weight,
+                                            degree_prescale=self.tp_probe_degree_prescale,
+                                            group_balance=self.tp_probe_group_balance)
 
             if self.depthwise:
                 out = self.linear_2(out)
+
+            if self.tp_probe_message_norm == 'pre_bn_node_rms':
+                out = _nodewise_rms_normalize(out)
 
             if self.batch_norm:
                 out = self.batch_norm(out)
@@ -330,6 +370,9 @@ class TensorProductConvLayer(torch.nn.Module):
         if self.residual:
             padded = F.pad(node_attr, (0, out.shape[-1] - node_attr.shape[-1]))
             out = out + padded
+
+        if self.tp_probe_message_norm == 'post_residual_node_rms':
+            out = _nodewise_rms_normalize(out)
 
         out = out.to(_dtype)
         return out

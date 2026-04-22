@@ -55,6 +55,7 @@ def parse_train_args():
     parser.add_argument('--ema_rate', type=float, default=0.999, help='decay rate for the exponential moving average model parameters ')
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of micro-batches to accumulate before optimizer step')
     parser.add_argument('--enable_logging', action='store_true', default=False, help='Enable per-epoch CSV and TensorBoard logging into the run_dir')
+    parser.add_argument('--parallel', type=int, default=1, help='Number of GPUs to use with PyG DataParallel')
 
     # Dataset
     parser.add_argument('--limit_complexes', type=int, default=5, help='If positive, the number of training and validation complexes is capped') # TODO change
@@ -128,6 +129,13 @@ def parse_train_args():
     parser.add_argument('--embedding_scale', type=int, default=1000, help='Parameter of the diffusion time embedding')
     parser.add_argument('--use_old_atom_encoder', action='store_true', default=False, help='option to use old atom encoder for backward compatibility')
     parser.add_argument('--depthwise_convolution', action='store_true', default=False, help='')
+    parser.add_argument('--tp_probe_message_norm', type=str, default='none',
+                        choices=['none', 'pre_bn_node_rms', 'post_residual_node_rms'],
+                        help='Experimental normalization placement for TensorProductConvLayer probe runs')
+    parser.add_argument('--tp_probe_degree_prescale', action='store_true', default=False,
+                        help='Experimental 1/sqrt(degree) prescaling before scatter in TensorProductConvLayer probe runs')
+    parser.add_argument('--tp_probe_group_balance', action='store_true', default=False,
+                        help='Experimental group RMS balancing for multi-group TensorProductConvLayer probe runs')
 
     parser.add_argument('--protein_file', type=str, default='protein_processed', help='')
     parser.add_argument('--no_aminoacid_identities', action='store_true', default=False, help='')

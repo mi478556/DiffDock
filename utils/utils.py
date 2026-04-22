@@ -273,7 +273,10 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                             atom_confidence=args.atom_confidence_loss_weight > 0.0 if "atom_confidence_loss_weight" in args else False,
                             sidechain_pred=(hasattr(args, 'sidechain_loss_weight') and args.sidechain_loss_weight > 0) or
                                            (hasattr(args, 'backbone_loss_weight') and args.backbone_loss_weight > 0),
-                            depthwise_convolution=args.depthwise_convolution if hasattr(args, 'depthwise_convolution') else False)
+                            depthwise_convolution=args.depthwise_convolution if hasattr(args, 'depthwise_convolution') else False,
+                            tp_probe_message_norm=args.tp_probe_message_norm if hasattr(args, 'tp_probe_message_norm') else 'none',
+                            tp_probe_degree_prescale=args.tp_probe_degree_prescale if hasattr(args, 'tp_probe_degree_prescale') else False,
+                            tp_probe_group_balance=args.tp_probe_group_balance if hasattr(args, 'tp_probe_group_balance') else False)
 
     # Only enable DataParallel if the user explicitly requests parallel training
     # via the `--parallel` argument (and requests more than 1 device). This

@@ -27,7 +27,6 @@ class CGOldModel(torch.nn.Module):
                  parallel_aggregators="mean max min std", num_confidence_outputs=1, fixed_center_conv=False,
                  no_aminoacid_identities=False, include_miscellaneous_atoms=False, use_old_atom_encoder=False):
         super(CGOldModel, self).__init__()
-        assert parallel == 1, "not implemented"
         assert (not no_aminoacid_identities) or (lm_embedding_type is None), "no language model emb without identities"
         self.t_to_sigma = t_to_sigma
         self.in_lig_edge_features = in_lig_edge_features

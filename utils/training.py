@@ -36,6 +36,37 @@ def _as_fp32_prediction(pred):
     return pred.float() if isinstance(pred, torch.Tensor) else pred
 
 
+def _uses_pyg_dataparallel(model):
+    return hasattr(model, 'module')
+
+
+def _batch_names(data):
+    if isinstance(data, (list, tuple)):
+        names = []
+        for idx, graph in enumerate(data):
+            name = getattr(graph, 'name', None)
+            if isinstance(name, str):
+                names.append(name)
+            elif name is None:
+                names.append(f'graph_{idx}')
+            else:
+                try:
+                    names.append(str(name))
+                except Exception:
+                    names.append(f'graph_{idx}')
+        return names
+
+    names = getattr(data, 'name', None)
+    if names is None:
+        return ['unknown']
+    if isinstance(names, str):
+        return [names]
+    try:
+        return [str(n) for n in list(names)]
+    except Exception:
+        return [str(names)]
+
+
 def _cosine_teacher_loss(pred, teacher, gate, min_teacher_norm, contribution_mask=None, pred_norm_eps=1e-3):
     pred = pred.float()
     teacher = teacher.detach().float()
@@ -535,11 +566,13 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             if has_bn:
                 print("Skipping batch of size 1 since otherwise batchnorm would not work.")
                 continue
-        # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
+        # PyG DataParallel expects a Python list and will scatter it itself.
         if isinstance(data, list):
-            data = Batch.from_data_list(data)
-        # move the whole batch to device (keep as a Batch), so model.forward receives the expected object
-        data = data.to(device) if device.type == 'cuda' else data
+            if not _uses_pyg_dataparallel(model):
+                data = Batch.from_data_list(data)
+                data = data.to(device) if device.type == 'cuda' else data
+        else:
+            data = data.to(device) if device.type == 'cuda' else data
         try:
             with _bf16_forward_context(device):
                 tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
@@ -558,7 +591,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             loss = loss_tuple[0]
 
             if _bad_loss_tensor(loss):
-                names = getattr(data, 'name', 'unknown')
+                names = _batch_names(data)
                 print("Bad loss, skipping batch with complexes", names)
                 continue
             score_loss_for_display = loss_tuple[1].detach()
@@ -570,20 +603,20 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 if max_grad_norm is not None and float(max_grad_norm) > 0.0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
                     if not torch.isfinite(grad_norm):
-                        names = getattr(data, 'name', 'unknown')
+                        names = _batch_names(data)
                         print("Bad gradient norm, skipping optimizer step with complexes", names)
                         optimizer.zero_grad(set_to_none=True)
                         accum_count = 0
                         continue
                 elif _has_nonfinite_grad(model.parameters()):
-                    names = getattr(data, 'name', 'unknown')
+                    names = _batch_names(data)
                     print("Bad gradients, skipping optimizer step with complexes", names)
                     optimizer.zero_grad(set_to_none=True)
                     accum_count = 0
                     continue
                 optimizer.step()
                 if _has_nonfinite_param(model.parameters()):
-                    names = getattr(data, 'name', 'unknown')
+                    names = _batch_names(data)
                     optimizer.zero_grad(set_to_none=True)
                     raise FloatingPointError(
                         f"Stopping training: optimizer step produced non-finite model parameters after complexes {names}"
@@ -671,11 +704,12 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     postfix_interval = 10
     for batch_idx, data in enumerate(progress):
         try:
-            # If loader yields a list (DataListLoader), convert to a Batch so model.forward receives the expected object
             if isinstance(data, list):
-                data = Batch.from_data_list(data)
-            # move the whole batch to device (keep as a Batch), so model.forward receives tensors on the same device
-            data = data.to(device) if device.type == 'cuda' else data
+                if not _uses_pyg_dataparallel(model):
+                    data = Batch.from_data_list(data)
+                    data = data.to(device) if device.type == 'cuda' else data
+            else:
+                data = data.to(device) if device.type == 'cuda' else data
             with torch.no_grad():
                 with _bf16_forward_context(device):
                     tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
@@ -691,7 +725,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             )
             if loss_tuple is None: continue
             if any(_bad_loss_tensor(v) for v in loss_tuple):
-                names = getattr(data, 'name', 'unknown')
+                names = _batch_names(data)
                 print("Bad validation loss, skipping batch with complexes", names)
                 continue
             meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])

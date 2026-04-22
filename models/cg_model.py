@@ -30,6 +30,13 @@ def safe_spherical_harmonics(irreps, edge_vec, normalize=True, normalization='co
 
 
 class CGModel(torch.nn.Module):
+    @staticmethod
+    def _configure_tp_probe(layer, message_norm='none', degree_prescale=False, group_balance=False):
+        layer.tp_probe_message_norm = message_norm
+        layer.tp_probe_degree_prescale = degree_prescale
+        layer.tp_probe_group_balance = group_balance
+        return layer
+
     def __init__(self, t_to_sigma, device, timestep_emb_func, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
                  ns=16, nv=4, num_conv_layers=2, lig_max_radius=5, rec_max_radius=30, cross_max_distance=250,
                  center_max_distance=30, distance_embed_dim=32, cross_distance_embed_dim=32, no_torsion=False,
@@ -41,9 +48,9 @@ class CGModel(torch.nn.Module):
                  parallel_aggregators="mean max min std", num_confidence_outputs=1, atom_num_confidence_outputs=1, fixed_center_conv=False,
                  no_aminoacid_identities=False, include_miscellaneous_atoms=False,
                  differentiate_convolutions=True, tp_weights_layers=2, num_prot_emb_layers=0, reduce_pseudoscalars=False,
-                 embed_also_ligand=False, atom_confidence=False, sidechain_pred=False, depthwise_convolution=False):
+                 embed_also_ligand=False, atom_confidence=False, sidechain_pred=False, depthwise_convolution=False,
+                 tp_probe_message_norm='none', tp_probe_degree_prescale=False, tp_probe_group_balance=False):
         super(CGModel, self).__init__()
-        assert parallel == 1, "not implemented"
         assert (not no_aminoacid_identities) or (lm_embedding_type is None), "no language model emb without identities"
         self.t_to_sigma = t_to_sigma
         self.in_lig_edge_features = in_lig_edge_features
@@ -79,6 +86,9 @@ class CGModel(torch.nn.Module):
         self.atom_confidence = atom_confidence
         self.atom_num_confidence_outputs = atom_num_confidence_outputs
         self.sidechain_pred = sidechain_pred
+        self.tp_probe_message_norm = tp_probe_message_norm
+        self.tp_probe_degree_prescale = tp_probe_degree_prescale
+        self.tp_probe_group_balance = tp_probe_group_balance
 
         self.lm_embedding_type = lm_embedding_type
         if lm_embedding_type is None:
@@ -136,7 +146,12 @@ class CGModel(torch.nn.Module):
                 edge_groups=1,
                 depthwise=depthwise_convolution
             )
-            rec_emb_layers.append(layer)
+            rec_emb_layers.append(self._configure_tp_probe(
+                layer,
+                message_norm=self.tp_probe_message_norm,
+                degree_prescale=self.tp_probe_degree_prescale,
+                group_balance=self.tp_probe_group_balance,
+            ))
         self.rec_emb_layers = nn.ModuleList(rec_emb_layers)
 
         self.embed_also_ligand = embed_also_ligand
@@ -159,7 +174,12 @@ class CGModel(torch.nn.Module):
                     edge_groups=1,
                     depthwise=depthwise_convolution
                 )
-                lig_emb_layers.append(layer)
+                lig_emb_layers.append(self._configure_tp_probe(
+                    layer,
+                    message_norm=self.tp_probe_message_norm,
+                    degree_prescale=self.tp_probe_degree_prescale,
+                    group_balance=self.tp_probe_group_balance,
+                ))
             self.lig_emb_layers = nn.ModuleList(lig_emb_layers)
 
         conv_layers = []
@@ -180,7 +200,12 @@ class CGModel(torch.nn.Module):
                 edge_groups=1 if not differentiate_convolutions else (2 if i == num_prot_emb_layers + num_conv_layers - 1 else 4),
                 depthwise=depthwise_convolution
             )
-            conv_layers.append(layer)
+            conv_layers.append(self._configure_tp_probe(
+                layer,
+                message_norm=self.tp_probe_message_norm,
+                degree_prescale=self.tp_probe_degree_prescale,
+                group_balance=self.tp_probe_group_balance,
+            ))
         self.conv_layers = nn.ModuleList(conv_layers)
 
         if sidechain_pred:
@@ -230,7 +255,7 @@ class CGModel(torch.nn.Module):
                 nn.Linear(ns, ns)
             )
 
-            self.final_conv = TensorProductConvLayer(
+            self.final_conv = self._configure_tp_probe(TensorProductConvLayer(
                 in_irreps=self.conv_layers[-1].out_irreps,
                 sh_irreps=self.sh_irreps,
                 out_irreps=f'2x1o + 2x1e' if not self.odd_parity else '1x1o + 1x1e',
@@ -238,7 +263,9 @@ class CGModel(torch.nn.Module):
                 residual=False,
                 dropout=dropout,
                 batch_norm=batch_norm
-            )
+            ), message_norm=self.tp_probe_message_norm,
+               degree_prescale=self.tp_probe_degree_prescale,
+               group_balance=self.tp_probe_group_balance)
             self.tr_final_layer = nn.Sequential(nn.Linear(1 + sigma_embed_dim, ns),nn.Dropout(dropout), nn.ReLU(), nn.Linear(ns, 1))
             self.rot_final_layer = nn.Sequential(nn.Linear(1 + sigma_embed_dim, ns),nn.Dropout(dropout), nn.ReLU(), nn.Linear(ns, 1))
 
@@ -251,7 +278,7 @@ class CGModel(torch.nn.Module):
                     nn.Linear(ns, ns)
                 )
                 self.final_tp_tor = o3.FullTensorProduct(self.sh_irreps, "2e")
-                self.tor_bond_conv = TensorProductConvLayer(
+                self.tor_bond_conv = self._configure_tp_probe(TensorProductConvLayer(
                     in_irreps=self.conv_layers[-1].out_irreps,
                     sh_irreps=self.final_tp_tor.irreps_out,
                     out_irreps=f'{ns}x0o + {ns}x0e' if not self.odd_parity else f'{ns}x0o',
@@ -259,7 +286,9 @@ class CGModel(torch.nn.Module):
                     residual=False,
                     dropout=dropout,
                     batch_norm=batch_norm
-                )
+                ), message_norm=self.tp_probe_message_norm,
+                   degree_prescale=self.tp_probe_degree_prescale,
+                   group_balance=self.tp_probe_group_balance)
                 self.tor_final_layer = nn.Sequential(
                     nn.Linear(2 * ns if not self.odd_parity else ns, ns, bias=False),
                     nn.Tanh(),
