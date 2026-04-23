@@ -540,7 +540,15 @@ def _has_nonfinite_param(parameters):
     return False
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1, max_grad_norm=None):
+def _dist_max_int(value, device):
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return int(value)
+    tensor = torch.tensor(int(value), device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return int(tensor.item())
+
+
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_accum_steps=1, max_grad_norm=None, ddp_loss_scale=1.0):
     model.train()
     meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
                           'rank_teacher_loss', 'rank_teacher_tr_loss', 'rank_teacher_rot_loss',
@@ -554,121 +562,140 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     progress = tqdm(loader, total=len(loader))
     postfix_interval = 10
     for batch_idx, data in enumerate(progress):
-        # determine if this is a single-example batch (support list or Batch)
+        local_skip = 0
+        skip_reason = None
+        loss_tuple = None
+        loss = None
+        score_loss_for_display = None
+
         if isinstance(data, list):
             single_batch = len(data) == 1
         else:
             single_batch = getattr(data, 'num_graphs', 1) == 1
 
         if single_batch:
-            # only skip if the model actually contains BatchNorm modules
             has_bn = any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in model.modules())
             if has_bn:
-                print("Skipping batch of size 1 since otherwise batchnorm would not work.")
-                continue
-        # PyG DataParallel expects a Python list and will scatter it itself.
+                local_skip = 1
+                skip_reason = "Skipping batch of size 1 since otherwise batchnorm would not work."
+
         if isinstance(data, list):
             if not _uses_pyg_dataparallel(model):
                 data = Batch.from_data_list(data)
                 data = data.to(device) if device.type == 'cuda' else data
         else:
             data = data.to(device) if device.type == 'cuda' else data
+
         try:
-            with _bf16_forward_context(device):
-                tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(
-                _as_fp32_prediction(tr_pred),
-                _as_fp32_prediction(rot_pred),
-                _as_fp32_prediction(tor_pred),
-                sidechain_pred,
-                data=data,
-                t_to_sigma=t_to_sigma,
-                device=device,
-            )
-            if loss_tuple is None:
-                print("None loss tuple, skipping")
-                continue
-            loss = loss_tuple[0]
-
-            if _bad_loss_tensor(loss):
-                names = _batch_names(data)
-                print("Bad loss, skipping batch with complexes", names)
-                continue
-            score_loss_for_display = loss_tuple[1].detach()
-            scaled_loss = loss / grad_accum_steps
-            scaled_loss.backward()
-            accum_count += 1
-
-            if accum_count == grad_accum_steps:
-                if max_grad_norm is not None and float(max_grad_norm) > 0.0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
-                    if not torch.isfinite(grad_norm):
+            if local_skip == 0:
+                with _bf16_forward_context(device):
+                    tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+                loss_tuple = loss_fn(
+                    _as_fp32_prediction(tr_pred),
+                    _as_fp32_prediction(rot_pred),
+                    _as_fp32_prediction(tor_pred),
+                    sidechain_pred,
+                    data=data,
+                    t_to_sigma=t_to_sigma,
+                    device=device,
+                )
+                if loss_tuple is None:
+                    local_skip = 1
+                    skip_reason = "None loss tuple, skipping"
+                else:
+                    loss = loss_tuple[0]
+                    if _bad_loss_tensor(loss):
                         names = _batch_names(data)
-                        print("Bad gradient norm, skipping optimizer step with complexes", names)
-                        optimizer.zero_grad(set_to_none=True)
-                        accum_count = 0
-                        continue
-                elif _has_nonfinite_grad(model.parameters()):
-                    names = _batch_names(data)
-                    print("Bad gradients, skipping optimizer step with complexes", names)
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_count = 0
-                    continue
-                optimizer.step()
-                if _has_nonfinite_param(model.parameters()):
-                    names = _batch_names(data)
-                    optimizer.zero_grad(set_to_none=True)
-                    raise FloatingPointError(
-                        f"Stopping training: optimizer step produced non-finite model parameters after complexes {names}"
-                    )
-                optimizer.zero_grad(set_to_none=True)
-                if ema_weights is not None:
-                    ema_weights.update(model.parameters())
-                accum_count = 0
-
-            meter.add([loss.detach().cpu(), *loss_tuple[1:]])
-            if not score_loss_for_display.dim() == 0:
-                score_loss_for_display = score_loss_for_display.mean()
-            if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
-                progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
-            
+                        local_skip = 1
+                        skip_reason = f"Bad loss, skipping batch with complexes {names}"
         except RuntimeError as e:
             if 'out of memory' in str(e):
-                print('| WARNING: ran out of memory, skipping batch')
+                local_skip = 1
+                skip_reason = '| WARNING: ran out of memory, skipping batch'
                 for p in model.parameters():
                     if p.grad is not None:
-                        del p.grad  # free some memory
+                        del p.grad
                 torch.cuda.empty_cache()
-                optimizer.zero_grad(set_to_none=True)
-                accum_count = 0
-                continue
             elif 'Input mismatch' in str(e):
-                print('| WARNING: weird torch_cluster error, skipping batch')
+                local_skip = 1
+                skip_reason = '| WARNING: weird torch_cluster error, skipping batch'
                 for p in model.parameters():
                     if p.grad is not None:
-                        del p.grad  # free some memory
+                        del p.grad
                 torch.cuda.empty_cache()
-                optimizer.zero_grad(set_to_none=True)
-                accum_count = 0
-                continue
             else:
-                #raise e
                 print(e)
                 optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 continue
 
+        global_skip = _dist_max_int(local_skip, device)
+        if global_skip:
+            if skip_reason is not None:
+                print(skip_reason)
+            optimizer.zero_grad(set_to_none=True)
+            accum_count = 0
+            continue
+
+        score_loss_for_display = loss_tuple[1].detach()
+        scaled_loss = (loss * float(ddp_loss_scale)) / grad_accum_steps
+        scaled_loss.backward()
+        accum_count += 1
+
+        if accum_count == grad_accum_steps:
+            local_step_skip = 0
+            step_skip_reason = None
+            if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+                if not torch.isfinite(grad_norm):
+                    names = _batch_names(data)
+                    local_step_skip = 1
+                    step_skip_reason = f"Bad gradient norm, skipping optimizer step with complexes {names}"
+            elif _has_nonfinite_grad(model.parameters()):
+                names = _batch_names(data)
+                local_step_skip = 1
+                step_skip_reason = f"Bad gradients, skipping optimizer step with complexes {names}"
+
+            global_step_skip = _dist_max_int(local_step_skip, device)
+            if global_step_skip:
+                if step_skip_reason is not None:
+                    print(step_skip_reason)
+                optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
+                continue
+
+            optimizer.step()
+            if _has_nonfinite_param(model.parameters()):
+                names = _batch_names(data)
+                optimizer.zero_grad(set_to_none=True)
+                raise FloatingPointError(
+                    f"Stopping training: optimizer step produced non-finite model parameters after complexes {names}"
+                )
+            optimizer.zero_grad(set_to_none=True)
+            if ema_weights is not None:
+                ema_weights.update(model.parameters())
+            accum_count = 0
+
+        meter.add([loss.detach().cpu(), *loss_tuple[1:]])
+        if not score_loss_for_display.dim() == 0:
+            score_loss_for_display = score_loss_for_display.mean()
+        if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
+            progress.set_postfix(score_loss=f'{score_loss_for_display.item():.4f}')
+
     if accum_count > 0:
+        local_step_skip = 0
         if max_grad_norm is not None and float(max_grad_norm) > 0.0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
             if not torch.isfinite(grad_norm):
-                print("Bad final gradient norm, skipping final optimizer step")
-                optimizer.zero_grad(set_to_none=True)
-                return meter.summary()
+                local_step_skip = 1
         elif _has_nonfinite_grad(model.parameters()):
-            print("Bad final gradients, skipping final optimizer step")
+            local_step_skip = 1
+
+        global_step_skip = _dist_max_int(local_step_skip, device)
+        if global_step_skip:
             optimizer.zero_grad(set_to_none=True)
             return meter.summary()
+
         optimizer.step()
         if _has_nonfinite_param(model.parameters()):
             optimizer.zero_grad(set_to_none=True)
@@ -676,7 +703,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         optimizer.zero_grad(set_to_none=True)
         if ema_weights is not None:
             ema_weights.update(model.parameters())
-            
+
     return meter.summary()
 
 
@@ -750,6 +777,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
 
         except RuntimeError as e:
             if 'out of memory' in str(e):
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    raise RuntimeError("DDP rank hit OOM during validation; aborting to avoid desynchronization") from e
                 print('| WARNING: ran out of memory, skipping batch')
                 for p in model.parameters():
                     if p.grad is not None:

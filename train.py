@@ -7,6 +7,9 @@ from functools import partial
 
 import wandb
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 import resource
@@ -16,10 +19,119 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (64000, rlimit[1]))
 import yaml
 import time
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, t_to_sigma_individual
-from datasets.loader import construct_loader
+from datasets.loader import construct_loader, construct_datasets, construct_loader_from_datasets
+from datasets.shared_memory import share_dataset_tree_
 from utils.parsing import parse_train_args
 from utils.training import train_epoch, test_epoch, loss_function, inference_epoch_fix
 from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage
+from torch.utils.data import Sampler
+
+
+def _is_main_process(args):
+    return int(getattr(args, 'rank', 0)) == 0
+
+
+def _all_reduce_metric_dict(metrics, device):
+    if not dist.is_initialized():
+        return metrics
+    reduced = {}
+    for k, v in metrics.items():
+        if v is None:
+            reduced[k] = v
+            continue
+        tensor = torch.tensor(float(v), device=device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        reduced[k] = float(tensor.item() / dist.get_world_size())
+    return reduced
+
+
+def _broadcast_scalar(value, device, src=0):
+    if not dist.is_initialized():
+        return value
+    tensor = torch.tensor(float(value), device=device)
+    dist.broadcast(tensor, src=src)
+    return float(tensor.item())
+
+
+def _broadcast_optional_scalar(value, device, src=0):
+    if not dist.is_initialized():
+        return value
+    has_value = torch.tensor(0 if value is None else 1, device=device, dtype=torch.int64)
+    dist.broadcast(has_value, src=src)
+    if int(has_value.item()) == 0:
+        return None
+    return _broadcast_scalar(0.0 if value is None else value, device, src=src)
+
+
+def _parse_gpu_list(spec):
+    if not spec:
+        raise ValueError("--shared_ddp_gpus is required when --use_shared_ddp is set")
+    return [int(x.strip()) for x in spec.split(',') if x.strip()]
+
+
+def _parse_local_batches(spec, global_batch_size, world_size):
+    if spec:
+        local_batches = [int(x.strip()) for x in spec.split(',') if x.strip()]
+        if len(local_batches) != world_size:
+            raise ValueError(f"--shared_ddp_local_batches must provide exactly {world_size} entries")
+        if sum(local_batches) != int(global_batch_size):
+            raise ValueError(
+                f"--shared_ddp_local_batches sums to {sum(local_batches)} but global batch_size is {global_batch_size}"
+            )
+        return local_batches
+
+    base = int(global_batch_size) // int(world_size)
+    remainder = int(global_batch_size) % int(world_size)
+    return [base + (1 if i < remainder else 0) for i in range(world_size)]
+
+
+class UnevenDistributedSampler(Sampler):
+    def __init__(self, dataset, num_replicas, rank, local_batch_sizes, shuffle=True, drop_last=False, seed=0):
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.local_batch_sizes = [int(x) for x in local_batch_sizes]
+        self.local_batch_size = int(self.local_batch_sizes[rank])
+        self.global_batch_size = int(sum(self.local_batch_sizes))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _num_steps(self):
+        n = len(self.dataset)
+        if self.drop_last:
+            return n // self.global_batch_size
+        return math.ceil(n / self.global_batch_size)
+
+    def __len__(self):
+        return self._num_steps() * self.local_batch_size
+
+    def __iter__(self):
+        n = len(self.dataset)
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(n, generator=g).tolist()
+        else:
+            indices = list(range(n))
+
+        num_steps = self._num_steps()
+        total_size = num_steps * self.global_batch_size
+        if self.drop_last:
+            indices = indices[:total_size]
+        elif total_size > len(indices):
+            indices = indices + indices[: total_size - len(indices)]
+
+        offset = sum(self.local_batch_sizes[:self.rank])
+        rank_indices = []
+        for step_idx in range(num_steps):
+            chunk = indices[step_idx * self.global_batch_size:(step_idx + 1) * self.global_batch_size]
+            rank_indices.extend(chunk[offset:offset + self.local_batch_size])
+        return iter(rank_indices)
 
 
 def _nested_tensors_are_finite(obj):
@@ -584,6 +696,385 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
 
 
+def _load_training_state(args, model, optimizer, ema_weights, device):
+    restart_epoch_offset = 0
+    if args.restart_dir:
+        try:
+            checkpoint = torch.load(f'{args.restart_dir}/{args.restart_ckpt}.pt', map_location=torch.device('cpu'))
+            if args.restart_lr is not None:
+                checkpoint['optimizer']['param_groups'][0]['lr'] = args.restart_lr
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            getattr(model, 'module', model).load_state_dict(checkpoint['model'], strict=True)
+            if hasattr(args, 'ema_rate'):
+                ema_weights.load_state_dict(checkpoint['ema_weights'], device=device)
+            if 'rank_oracle_rot_weight' in checkpoint:
+                args.rank_oracle_rot_weight = checkpoint['rank_oracle_rot_weight']
+            args._rank_oracle_rot_ema_rank_loss = checkpoint.get('rank_oracle_rot_ema_rank_loss')
+            args._rank_oracle_rot_ema_oracle_loss = checkpoint.get('rank_oracle_rot_ema_oracle_loss')
+            restart_epoch_offset = int(checkpoint['epoch']) + 1
+            print("Restarting from epoch", checkpoint['epoch'])
+        except Exception as e:
+            print("Exception", e)
+            checkpoint = torch.load(f'{args.restart_dir}/best_model.pt', map_location=torch.device('cpu'))
+            getattr(model, 'module', model).load_state_dict(checkpoint, strict=True)
+            print("Due to exception had to take the best epoch and no optimiser")
+    elif args.pretrain_dir:
+        checkpoint = torch.load(f'{args.pretrain_dir}/{args.pretrain_ckpt}.pt', map_location=torch.device('cpu'))
+        getattr(model, 'module', model).load_state_dict(checkpoint, strict=True)
+        print("Using pretrained model", f'{args.pretrain_dir}/{args.pretrain_ckpt}.pt')
+    args._restart_epoch_offset = restart_epoch_offset
+
+
+def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset2, device):
+    rank = int(args.rank)
+    is_main = rank == 0
+    best_val_loss = math.inf
+    best_val_inference_value = math.inf if args.inference_earlystop_goal == 'min' else 0
+    best_val_secondary_value = math.inf if args.inference_earlystop_goal == 'min' else 0
+    best_epoch = 0
+    best_val_inference_epoch = 0
+    current_rank_oracle_rot_weight = float(getattr(args, 'rank_oracle_rot_weight', 0.0))
+    rank_oracle_rot_ema_rank_loss = getattr(args, '_rank_oracle_rot_ema_rank_loss', None)
+    rank_oracle_rot_ema_oracle_loss = getattr(args, '_rank_oracle_rot_ema_oracle_loss', None)
+    restart_epoch_offset = int(getattr(args, '_restart_epoch_offset', 0))
+
+    os.makedirs(run_dir, exist_ok=True) if is_main else None
+    if is_main:
+        save_yaml_file(os.path.join(run_dir, 'model_parameters.yml'), args.__dict__)
+        print("Starting shared-memory DDP training...")
+
+    freeze_params = 0
+    scheduler_mode = args.inference_earlystop_goal if args.val_inference_freq is not None else 'min'
+    if args.scheduler == 'layer_linear_warmup':
+        freeze_params = args.warmup_dur * (args.num_conv_layers + 2) - 1
+
+    for epoch in range(args.n_epochs):
+        epoch_num = epoch + restart_epoch_offset
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch_num)
+        epoch_rank_oracle_rot_weight = current_rank_oracle_rot_weight
+        logs = {}
+
+        train_loss_fn = functools.partial(
+            loss_function,
+            tr_weight=1.0, rot_weight=1.0, tor_weight=1.0,
+            no_torsion=args.no_torsion,
+            rank_weight=args.rank_weight,
+            rank_mode=args.rank_mode,
+            rank_k=args.rank_k,
+            rank_sigma=args.rank_sigma,
+            rank_alpha_tr=args.rank_alpha_tr,
+            rank_alpha_rot=args.rank_alpha_rot,
+            rank_ensemble_samples=args.rank_ensemble_samples,
+            rank_ensemble_tr_std=args.rank_ensemble_tr_std,
+            rank_ensemble_rot_std=args.rank_ensemble_rot_std,
+            rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
+            rank_gate_type=args.rank_gate_type,
+            rank_soft_gate_cutoff=args.rank_soft_gate_cutoff,
+            rank_soft_gate_temp=args.rank_soft_gate_temp,
+            rank_prune_eps=args.rank_prune_eps,
+            rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
+            rank_teacher_weight=args.rank_teacher_weight,
+            rank_teacher_tr_weight=args.rank_teacher_tr_weight,
+            rank_teacher_rot_weight=args.rank_teacher_rot_weight,
+            rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
+            rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
+            rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
+            rank_teacher_mode=getattr(args, 'rank_teacher_mode', None),
+            rank_oracle_rot_weight=epoch_rank_oracle_rot_weight,
+            rank_oracle_rot_mode=getattr(args, 'rank_oracle_rot_mode', None),
+            rank_oracle_rot_probe_eps=args.rank_oracle_rot_probe_eps,
+            rank_oracle_rot_sigma_min=args.rank_oracle_rot_sigma_min,
+            rank_oracle_rot_sigma_max=args.rank_oracle_rot_sigma_max,
+            rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
+            rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
+            rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
+            rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
+            rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
+        )
+        train_losses = train_epoch(
+            model, train_loader, optimizer, device, t_to_sigma, train_loss_fn,
+            ema_weights if epoch > freeze_params else None,
+            grad_accum_steps=args.grad_accum_steps,
+            max_grad_norm=args.max_grad_norm,
+            ddp_loss_scale=float(getattr(args, '_shared_ddp_loss_scale', 1.0)),
+        )
+        train_losses = _all_reduce_metric_dict(train_losses, device)
+
+        if is_main:
+            print("Epoch {}: Training score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}  lr {:.4f}"
+                  .format(epoch_num, train_losses['score_loss'], train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
+                          train_losses['tor_loss'], train_losses['rank_loss'], train_losses.get('rank_gate_mean', 1.0), optimizer.param_groups[0]['lr']))
+            print("Epoch {}: Training teacher {:.4f}  teacher_tr {:.4f}  teacher_rot {:.4f}  teacher_active {:.4f}  teacher_tr_cos {:.4f}  teacher_rot_cos {:.4f}"
+                  .format(epoch_num, train_losses.get('rank_teacher_loss', 0.0), train_losses.get('rank_teacher_tr_loss', 0.0),
+                          train_losses.get('rank_teacher_rot_loss', 0.0), train_losses.get('rank_teacher_active_mean', 0.0),
+                          train_losses.get('rank_teacher_tr_cos', 0.0), train_losses.get('rank_teacher_rot_cos', 0.0)))
+            print("Epoch {}: Training oracle_rot {:.4f}  active {:.4f}  target_cos {:.4f}  delta {:.4f}  energy_drop {:.4f}"
+                  .format(epoch_num, train_losses.get('rank_oracle_rot_loss', 0.0), train_losses.get('rank_oracle_rot_active_mean', 0.0),
+                          train_losses.get('rank_oracle_rot_cos', 0.0), train_losses.get('rank_oracle_rot_delta', 0.0),
+                          train_losses.get('rank_oracle_rot_energy_drop', 0.0)))
+            logs.update({'train_' + k: v for k, v in train_losses.items()})
+
+        dynamic_target_weight = None
+        if getattr(args, 'rank_oracle_rot_dynamic_weight', False):
+            ema_beta = float(getattr(args, 'rank_oracle_rot_dynamic_ema_beta', 0.9))
+            ema_beta = min(max(ema_beta, 0.0), 0.999999)
+            current_rank_loss = float(train_losses.get('rank_loss', 0.0) or 0.0)
+            current_oracle_loss = float(train_losses.get('rank_oracle_rot_loss', 0.0) or 0.0)
+            rank_oracle_rot_ema_rank_loss = current_rank_loss if rank_oracle_rot_ema_rank_loss is None else (ema_beta * rank_oracle_rot_ema_rank_loss + (1.0 - ema_beta) * current_rank_loss)
+            rank_oracle_rot_ema_oracle_loss = current_oracle_loss if rank_oracle_rot_ema_oracle_loss is None else (ema_beta * rank_oracle_rot_ema_oracle_loss + (1.0 - ema_beta) * current_oracle_loss)
+            oracle_eps = max(float(getattr(args, 'rank_oracle_rot_dynamic_eps', 1e-6)), 1e-12)
+            dynamic_target_weight = float(args.rank_oracle_rot_dynamic_target_ratio) * rank_oracle_rot_ema_rank_loss / max(rank_oracle_rot_ema_oracle_loss, oracle_eps)
+            dynamic_target_weight = _clamp_optional(dynamic_target_weight, getattr(args, 'rank_oracle_rot_dynamic_weight_min', None), getattr(args, 'rank_oracle_rot_dynamic_weight_max', None))
+            max_rel_change = getattr(args, 'rank_oracle_rot_dynamic_max_rel_change', None)
+            if max_rel_change is not None and current_rank_oracle_rot_weight > 0.0:
+                max_rel_change = max(float(max_rel_change), 0.0)
+                dynamic_target_weight = _clamp_optional(dynamic_target_weight, current_rank_oracle_rot_weight * (1.0 - max_rel_change), current_rank_oracle_rot_weight * (1.0 + max_rel_change))
+            current_rank_oracle_rot_weight = dynamic_target_weight
+            if is_main:
+                print(
+                    "Epoch {}: Dynamic oracle weight {:.4f} -> {:.4f}  target_ratio {:.4f}  ema_rank {:.4f}  ema_oracle {:.4f}".format(
+                        epoch_num,
+                        epoch_rank_oracle_rot_weight,
+                        dynamic_target_weight,
+                        float(args.rank_oracle_rot_dynamic_target_ratio),
+                        rank_oracle_rot_ema_rank_loss,
+                        rank_oracle_rot_ema_oracle_loss,
+                    )
+                )
+
+        if epoch > freeze_params:
+            ema_weights.store(model.parameters())
+            if args.use_ema:
+                ema_weights.copy_to(model.parameters())
+
+        if is_main:
+            val_rank_weight = args.rank_weight if getattr(args, 'val_rank_weight', None) is None else args.val_rank_weight
+            val_rank_teacher_weight = args.rank_teacher_weight if getattr(args, 'val_rank_teacher_weight', None) is None else args.val_rank_teacher_weight
+            val_rank_oracle_rot_weight = epoch_rank_oracle_rot_weight if getattr(args, 'val_rank_oracle_rot_weight', None) is None else args.val_rank_oracle_rot_weight
+            val_loss_fn = functools.partial(
+                loss_function,
+                tr_weight=1.0, rot_weight=1.0, tor_weight=1.0,
+                no_torsion=args.no_torsion,
+                rank_weight=val_rank_weight,
+                rank_mode=args.rank_mode,
+                rank_k=args.rank_k,
+                rank_sigma=args.rank_sigma,
+                rank_alpha_tr=args.rank_alpha_tr,
+                rank_alpha_rot=args.rank_alpha_rot,
+                rank_ensemble_samples=args.rank_ensemble_samples,
+                rank_ensemble_tr_std=args.rank_ensemble_tr_std,
+                rank_ensemble_rot_std=args.rank_ensemble_rot_std,
+                rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
+                rank_gate_type=args.rank_gate_type,
+                rank_soft_gate_cutoff=args.rank_soft_gate_cutoff,
+                rank_soft_gate_temp=args.rank_soft_gate_temp,
+                rank_prune_eps=args.rank_prune_eps,
+                rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
+                rank_teacher_weight=val_rank_teacher_weight,
+                rank_teacher_tr_weight=args.rank_teacher_tr_weight,
+                rank_teacher_rot_weight=args.rank_teacher_rot_weight,
+                rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
+                rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
+                rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
+                rank_teacher_mode=getattr(args, 'rank_teacher_mode', None),
+                rank_oracle_rot_weight=val_rank_oracle_rot_weight,
+                rank_oracle_rot_mode=getattr(args, 'rank_oracle_rot_mode', None),
+                rank_oracle_rot_probe_eps=args.rank_oracle_rot_probe_eps,
+                rank_oracle_rot_sigma_min=args.rank_oracle_rot_sigma_min,
+                rank_oracle_rot_sigma_max=args.rank_oracle_rot_sigma_max,
+                rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
+                rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
+                rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
+                rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
+                rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
+            )
+            val_losses = test_epoch(model.module, val_loader, device, t_to_sigma, val_loss_fn, args.test_sigma_intervals)
+            logs.update({'val_' + k: v for k, v in val_losses.items()})
+            val_selection_loss = val_losses.get('score_loss', val_losses['loss'])
+            print("Epoch {}: Validation score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}"
+                  .format(epoch_num, val_losses['score_loss'], val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'],
+                          val_losses['tor_loss'], val_losses['rank_loss'], val_losses.get('rank_gate_mean', 1.0)))
+            print("Epoch {}: Validation teacher {:.4f}  teacher_tr {:.4f}  teacher_rot {:.4f}  teacher_active {:.4f}  teacher_tr_cos {:.4f}  teacher_rot_cos {:.4f}"
+                  .format(epoch_num, val_losses.get('rank_teacher_loss', 0.0), val_losses.get('rank_teacher_tr_loss', 0.0),
+                          val_losses.get('rank_teacher_rot_loss', 0.0), val_losses.get('rank_teacher_active_mean', 0.0),
+                          val_losses.get('rank_teacher_tr_cos', 0.0), val_losses.get('rank_teacher_rot_cos', 0.0)))
+            print("Epoch {}: Validation oracle_rot {:.4f}  active {:.4f}  target_cos {:.4f}  delta {:.4f}  energy_drop {:.4f}"
+                  .format(epoch_num, val_losses.get('rank_oracle_rot_loss', 0.0), val_losses.get('rank_oracle_rot_active_mean', 0.0),
+                          val_losses.get('rank_oracle_rot_cos', 0.0), val_losses.get('rank_oracle_rot_delta', 0.0),
+                          val_losses.get('rank_oracle_rot_energy_drop', 0.0)))
+
+            if args.val_inference_freq is not None and (epoch_num + 1) % args.val_inference_freq == 0:
+                inf_dataset = [val_loader.dataset.get(i) for i in range(min(args.num_inference_complexes, val_loader.dataset.__len__()))]
+                inf_metrics = inference_epoch_fix(model.module, inf_dataset, device, t_to_sigma, args)
+                print("Epoch {}: Val inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
+                      .format(epoch_num, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5']))
+                logs.update({'valinf_' + k: v for k, v in inf_metrics.items()})
+                logs['step'] = epoch_num + 1
+
+            if args.double_val and val_dataset2 is not None and args.val_inference_freq is not None and (epoch_num + 1) % args.val_inference_freq == 0:
+                inf_dataset = [val_dataset2.get(i) for i in range(min(args.num_inference_complexes, val_dataset2.__len__()))]
+                inf_metrics2 = inference_epoch_fix(model.module, inf_dataset, device, t_to_sigma, args)
+                print("Epoch {}: Val inference on second validation rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
+                      .format(epoch_num, inf_metrics2['rmsds_lt2'], inf_metrics2['rmsds_lt5'], inf_metrics2['min_rmsds_lt2'], inf_metrics2['min_rmsds_lt5']))
+                logs.update({'valinf2_' + k: v for k, v in inf_metrics2.items()})
+                logs.update({'valinfcomb_' + k: (v + inf_metrics[k]) / 2 for k, v in inf_metrics2.items()})
+                logs['step'] = epoch_num + 1
+
+            if args.inference_earlystop_metric in logs.keys() and \
+                    (args.inference_earlystop_goal == 'min' and logs[args.inference_earlystop_metric] <= best_val_inference_value or
+                     args.inference_earlystop_goal == 'max' and logs[args.inference_earlystop_metric] >= best_val_inference_value):
+                state_dict = copy.deepcopy(model.module.state_dict())
+                saved_best_inference = _save_finite_state_dict(
+                    state_dict,
+                    os.path.join(run_dir, 'best_inference_epoch_model.pt'),
+                    'best inference',
+                )
+                if saved_best_inference:
+                    best_val_inference_value = logs[args.inference_earlystop_metric]
+                    best_val_inference_epoch = epoch_num
+                if saved_best_inference and epoch > freeze_params:
+                    ema_state_dict = copy.deepcopy(model.module.state_dict())
+                    _save_finite_state_dict(ema_state_dict, os.path.join(run_dir, 'best_ema_inference_epoch_model.pt'), 'best EMA inference')
+
+            if args.inference_secondary_metric is not None and args.inference_secondary_metric in logs.keys() and \
+                    (args.inference_earlystop_goal == 'min' and logs[args.inference_secondary_metric] <= best_val_secondary_value or
+                     args.inference_earlystop_goal == 'max' and logs[args.inference_secondary_metric] >= best_val_secondary_value):
+                if epoch > freeze_params:
+                    ema_state_dict = copy.deepcopy(model.module.state_dict())
+                    saved_secondary = _save_finite_state_dict(
+                        ema_state_dict,
+                        os.path.join(run_dir, 'best_ema_secondary_epoch_model.pt'),
+                        'best EMA secondary',
+                    )
+                    if saved_secondary:
+                        best_val_secondary_value = logs[args.inference_secondary_metric]
+
+            if val_selection_loss <= best_val_loss:
+                state_dict = copy.deepcopy(model.module.state_dict())
+                saved_best_validation = _save_finite_state_dict(state_dict, os.path.join(run_dir, 'best_model.pt'), 'best validation')
+                if saved_best_validation:
+                    best_val_loss = val_selection_loss
+                    best_epoch = epoch_num
+                if saved_best_validation and epoch > freeze_params:
+                    ema_state_dict = copy.deepcopy(model.module.state_dict())
+                    _save_finite_state_dict(ema_state_dict, os.path.join(run_dir, 'best_ema_model.pt'), 'best EMA validation')
+            last_checkpoint = {
+                'epoch': epoch_num,
+                'model': copy.deepcopy(model.module.state_dict()),
+                'optimizer': optimizer.state_dict(),
+                'ema_weights': ema_weights.state_dict(),
+                'rank_oracle_rot_weight': current_rank_oracle_rot_weight,
+                'rank_oracle_rot_ema_rank_loss': rank_oracle_rot_ema_rank_loss,
+                'rank_oracle_rot_ema_oracle_loss': rank_oracle_rot_ema_oracle_loss,
+            }
+            if _nested_tensors_are_finite(last_checkpoint):
+                torch.save(last_checkpoint, os.path.join(run_dir, 'last_model.pt'))
+        else:
+            val_selection_loss = 0.0
+
+        val_selection_loss = _broadcast_scalar(val_selection_loss, device)
+        current_rank_oracle_rot_weight = _broadcast_scalar(current_rank_oracle_rot_weight, device)
+        rank_oracle_rot_ema_rank_loss = _broadcast_optional_scalar(rank_oracle_rot_ema_rank_loss, device)
+        rank_oracle_rot_ema_oracle_loss = _broadcast_optional_scalar(rank_oracle_rot_ema_oracle_loss, device)
+
+        if epoch > freeze_params and not args.use_ema:
+            ema_weights.copy_to(model.parameters())
+        if epoch > freeze_params:
+            ema_weights.restore(model.parameters())
+
+        if scheduler:
+            if epoch < freeze_params or (args.scheduler == 'linear_warmup' and epoch < args.warmup_dur):
+                scheduler.step()
+            elif args.val_inference_freq is not None:
+                scheduler.step(best_val_inference_value)
+            else:
+                scheduler.step(val_selection_loss)
+        dist.barrier()
+
+    if is_main:
+        print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
+        print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
+
+
+def _shared_ddp_worker(rank, args, gpu_ids, datasets, local_batches):
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = str(args.shared_ddp_port)
+    torch.cuda.set_device(gpu_ids[rank])
+    dist.init_process_group('nccl', rank=rank, world_size=len(gpu_ids))
+    device = torch.device(f'cuda:{gpu_ids[rank]}')
+    args.rank = rank
+    args.world_size = len(gpu_ids)
+    args.device = device
+    args.parallel = 1
+    args._shared_ddp_local_batch_size = int(local_batches[rank])
+    args._shared_ddp_global_batch_size = int(sum(local_batches))
+    args._shared_ddp_loss_scale = (
+        float(len(gpu_ids)) * float(args._shared_ddp_local_batch_size) / float(args._shared_ddp_global_batch_size)
+    )
+    t_to_sigma = partial(t_to_sigma_compl, args=args)
+    train_dataset, val_dataset, val_dataset2 = datasets
+    train_sampler = UnevenDistributedSampler(
+        train_dataset,
+        num_replicas=len(gpu_ids),
+        rank=rank,
+        local_batch_sizes=local_batches,
+        shuffle=True,
+        drop_last=args.dataloader_drop_last,
+    )
+    train_loader, _ = construct_loader_from_datasets(
+        args,
+        device,
+        train_dataset,
+        val_dataset,
+        train_sampler=train_sampler,
+        batch_size=args._shared_ddp_local_batch_size,
+    )
+    if rank == 0:
+        _, val_loader = construct_loader_from_datasets(args, device, train_dataset, val_dataset)
+    else:
+        val_loader = None
+
+    model = get_model(args, device, t_to_sigma=t_to_sigma)
+    optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
+    ema_weights = ExponentialMovingAverage(model.parameters(), decay=args.ema_rate)
+    _load_training_state(args, model, optimizer, ema_weights, device)
+    model = DDP(
+        model.to(device),
+        device_ids=[gpu_ids[rank]],
+        output_device=gpu_ids[rank],
+        broadcast_buffers=True,
+        find_unused_parameters=True,
+    )
+
+    run_dir = os.path.join(args.log_dir, args.run_name)
+    train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset2, device)
+    dist.destroy_process_group()
+
+
+def launch_shared_ddp(args):
+    if args.num_dataloader_workers != 0:
+        print("Overriding num_dataloader_workers to 0 for shared-memory DDP")
+        args.num_dataloader_workers = 0
+    gpu_ids = _parse_gpu_list(args.shared_ddp_gpus)
+    local_batches = _parse_local_batches(args.shared_ddp_local_batches, args.batch_size, len(gpu_ids))
+    t_to_sigma = partial(t_to_sigma_compl, args=args)
+    train_dataset, val_dataset, val_dataset2 = construct_datasets(args, t_to_sigma)
+    share_dataset_tree_(train_dataset)
+    share_dataset_tree_(val_dataset)
+    if val_dataset2 is not None and val_dataset2 is not val_dataset:
+        share_dataset_tree_(val_dataset2)
+    datasets = (train_dataset, val_dataset, val_dataset2)
+    print(f"Shared-memory DDP local train batches: {local_batches} (global batch_size={args.batch_size})")
+    mp.start_processes(
+        _shared_ddp_worker,
+        args=(args, gpu_ids, datasets, local_batches),
+        nprocs=len(gpu_ids),
+        start_method='spawn',
+        join=True,
+    )
+
+
 def main_function():
     args = parse_train_args()
     # Load config from file if provided. Support argparse FileType or a string path.
@@ -610,6 +1101,10 @@ def main_function():
         assert (args.scheduler_patience > args.val_inference_freq) # otherwise we will just stop training after args.scheduler_patience epochs
     if args.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
+
+    if getattr(args, 'use_shared_ddp', False):
+        launch_shared_ddp(args)
+        return
 
     if args.wandb:
         wandb.init(

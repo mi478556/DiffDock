@@ -56,6 +56,10 @@ def parse_train_args():
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of micro-batches to accumulate before optimizer step')
     parser.add_argument('--enable_logging', action='store_true', default=False, help='Enable per-epoch CSV and TensorBoard logging into the run_dir')
     parser.add_argument('--parallel', type=int, default=1, help='Number of GPUs to use with PyG DataParallel')
+    parser.add_argument('--use_shared_ddp', action='store_true', default=False, help='Launch shared-memory DDP from a single parent process')
+    parser.add_argument('--shared_ddp_gpus', type=str, default='', help='Comma-separated CUDA device ids for shared-memory DDP, e.g. "0,1,2"')
+    parser.add_argument('--shared_ddp_port', type=int, default=29517, help='TCP port for shared-memory DDP init')
+    parser.add_argument('--shared_ddp_local_batches', type=str, default='', help='Optional comma-separated per-rank local batch sizes, e.g. "4,4,8". If omitted, args.batch_size is split across ranks.')
 
     # Dataset
     parser.add_argument('--limit_complexes', type=int, default=5, help='If positive, the number of training and validation complexes is capped') # TODO change

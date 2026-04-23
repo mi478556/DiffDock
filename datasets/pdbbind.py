@@ -111,6 +111,39 @@ from utils.torsion import get_transformation_mask
 _WORKER_CFG = {}
 
 
+def _share_nested_tensors_(obj):
+    if torch.is_tensor(obj):
+        if obj.device.type == "cpu":
+            obj.share_memory_()
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _share_nested_tensors_(v)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            _share_nested_tensors_(v)
+        return
+    if hasattr(obj, "stores"):
+        try:
+            for store in obj.stores:
+                for _, v in store.items():
+                    _share_nested_tensors_(v)
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        for v in obj.__dict__.values():
+            _share_nested_tensors_(v)
+
+
+def share_pdbbind_dataset_(dataset):
+    if not isinstance(dataset, PDBBind):
+        return dataset
+    for graph in dataset.complex_graphs:
+        _share_nested_tensors_(graph)
+    return dataset
+
+
 def _worker_init(cfg):
     global _WORKER_CFG
     _WORKER_CFG = cfg

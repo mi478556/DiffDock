@@ -28,10 +28,9 @@ class CombineDatasets(Dataset):
         self.dataset1.add_complexes(new_complex_list)
 
 
-def construct_loader(args, t_to_sigma, device):
+def construct_datasets(args, t_to_sigma):
     val_dataset2 = None
     parallel_flag = int(getattr(args, 'parallel', 1) or 1)
-    use_datalist_loader = device.type == 'cuda' and parallel_flag > 1
     transform = NoiseTransform(t_to_sigma=t_to_sigma, no_torsion=args.no_torsion,
                                all_atom=args.all_atoms, alpha=args.sampling_alpha, beta=args.sampling_beta,
                                include_miscellaneous_atoms=False if not hasattr(args, 'include_miscellaneous_atoms') else args.include_miscellaneous_atoms,
@@ -68,7 +67,6 @@ def construct_loader(args, t_to_sigma, device):
         if args.dataset == 'pdbsidechain':
             train_dataset = train_dataset3
             val_dataset = PDBSidechain(cache_path=args.cache_path, split='val', multiplicity=args.val_multiplicity, **common_args)
-        loader_class = DataListLoader if use_datalist_loader else DataLoader
 
     if args.dataset in ['pdbbind', 'moad', 'generalisation', 'distillation']:
         common_args = {'transform': transform, 'limit_complexes': args.limit_complexes,
@@ -120,8 +118,22 @@ def construct_loader(args, t_to_sigma, device):
                                unroll_clusters=args.unroll_clusters, root=args.moad_dir,
                                esm_embeddings_path=args.moad_esm_embeddings_path, require_ligand=True, **common_args)
 
-        loader_class = DataListLoader if use_datalist_loader else DataLoader
+    return train_dataset, val_dataset, val_dataset2
 
-    train_loader = loader_class(dataset=train_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
-    val_loader = loader_class(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=False, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
+
+def construct_loader_from_datasets(args, device, train_dataset, val_dataset, train_sampler=None, val_sampler=None, batch_size=None, val_batch_size=None):
+    parallel_flag = int(getattr(args, 'parallel', 1) or 1)
+    use_datalist_loader = device.type == 'cuda' and parallel_flag > 1
+    loader_class = DataListLoader if use_datalist_loader else DataLoader
+    train_bs = args.batch_size if batch_size is None else batch_size
+    val_bs = args.batch_size if val_batch_size is None else val_batch_size
+
+    train_loader = loader_class(dataset=train_dataset, batch_size=train_bs, num_workers=args.num_dataloader_workers, shuffle=(train_sampler is None), sampler=train_sampler, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
+    val_loader = loader_class(dataset=val_dataset, batch_size=val_bs, num_workers=args.num_dataloader_workers, shuffle=False, sampler=val_sampler, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
+    return train_loader, val_loader
+
+
+def construct_loader(args, t_to_sigma, device):
+    train_dataset, val_dataset, val_dataset2 = construct_datasets(args, t_to_sigma)
+    train_loader, val_loader = construct_loader_from_datasets(args, device, train_dataset, val_dataset)
     return train_loader, val_loader, val_dataset2
