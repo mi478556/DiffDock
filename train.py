@@ -45,6 +45,40 @@ def _all_reduce_metric_dict(metrics, device):
     return reduced
 
 
+def _all_reduce_inference_counts(counts, device):
+    if not dist.is_initialized():
+        return counts
+    reduced = {}
+    for k, v in counts.items():
+        tensor = torch.tensor(float(v), device=device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        reduced[k] = float(tensor.item())
+    return reduced
+
+
+def _counts_to_inference_metrics(counts):
+    rmsds_total = max(float(counts.get('rmsds_total', 0.0)), 1.0)
+    min_rmsds_total = max(float(counts.get('min_rmsds_total', 0.0)), 1.0)
+    return {
+        'rmsds_lt2': 100.0 * float(counts.get('rmsds_lt2_count', 0.0)) / rmsds_total,
+        'rmsds_lt5': 100.0 * float(counts.get('rmsds_lt5_count', 0.0)) / rmsds_total,
+        'min_rmsds_lt2': 100.0 * float(counts.get('min_rmsds_lt2_count', 0.0)) / min_rmsds_total,
+        'min_rmsds_lt5': 100.0 * float(counts.get('min_rmsds_lt5_count', 0.0)) / min_rmsds_total,
+    }
+
+
+def _distributed_inference_indices(total_size, rank, local_batches):
+    local_batches = [int(x) for x in local_batches]
+    global_batch_size = int(sum(local_batches))
+    offset = int(sum(local_batches[:int(rank)]))
+    local_batch_size = int(local_batches[int(rank)])
+    indices = []
+    for start in range(0, int(total_size), global_batch_size):
+        chunk = list(range(start, min(start + global_batch_size, int(total_size))))
+        indices.extend(chunk[offset:offset + local_batch_size])
+    return indices
+
+
 def _broadcast_scalar(value, device, src=0):
     if not dist.is_initialized():
         return value
@@ -725,7 +759,7 @@ def _load_training_state(args, model, optimizer, ema_weights, device):
     args._restart_epoch_offset = restart_epoch_offset
 
 
-def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset2, device):
+def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset, val_dataset2, device):
     rank = int(args.rank)
     is_main = rank == 0
     best_val_loss = math.inf
@@ -904,23 +938,55 @@ def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loade
                           val_losses.get('rank_oracle_rot_cos', 0.0), val_losses.get('rank_oracle_rot_delta', 0.0),
                           val_losses.get('rank_oracle_rot_energy_drop', 0.0)))
 
-            if args.val_inference_freq is not None and (epoch_num + 1) % args.val_inference_freq == 0:
-                inf_dataset = [val_loader.dataset.get(i) for i in range(min(args.num_inference_complexes, val_loader.dataset.__len__()))]
-                inf_metrics = inference_epoch_fix(model.module, inf_dataset, device, t_to_sigma, args)
+        run_val_inference = args.val_inference_freq is not None and (epoch_num + 1) % args.val_inference_freq == 0
+        if is_main and run_val_inference:
+            print("Epoch {}: Running shared-DDP validation inference".format(epoch_num))
+        if run_val_inference:
+            total_inf = min(args.num_inference_complexes, val_dataset.__len__())
+            local_indices = _distributed_inference_indices(total_inf, rank, args._shared_ddp_local_batches)
+            inf_dataset = [val_dataset.get(i) for i in local_indices]
+            inf_counts = inference_epoch_fix(
+                model.module,
+                inf_dataset,
+                device,
+                t_to_sigma,
+                args,
+                return_counts=True,
+                show_progress=is_main,
+            )
+            inf_counts = _all_reduce_inference_counts(inf_counts, device)
+            inf_metrics = _counts_to_inference_metrics(inf_counts)
+            if is_main:
                 print("Epoch {}: Val inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
                       .format(epoch_num, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5']))
                 logs.update({'valinf_' + k: v for k, v in inf_metrics.items()})
                 logs['step'] = epoch_num + 1
 
-            if args.double_val and val_dataset2 is not None and args.val_inference_freq is not None and (epoch_num + 1) % args.val_inference_freq == 0:
-                inf_dataset = [val_dataset2.get(i) for i in range(min(args.num_inference_complexes, val_dataset2.__len__()))]
-                inf_metrics2 = inference_epoch_fix(model.module, inf_dataset, device, t_to_sigma, args)
+            if is_main and args.double_val and val_dataset2 is not None:
+                print("Epoch {}: Running shared-DDP second validation inference".format(epoch_num))
+            if args.double_val and val_dataset2 is not None:
+                total_inf2 = min(args.num_inference_complexes, val_dataset2.__len__())
+                local_indices2 = _distributed_inference_indices(total_inf2, rank, args._shared_ddp_local_batches)
+                inf_dataset2 = [val_dataset2.get(i) for i in local_indices2]
+                inf_counts2 = inference_epoch_fix(
+                    model.module,
+                    inf_dataset2,
+                    device,
+                    t_to_sigma,
+                    args,
+                    return_counts=True,
+                    show_progress=is_main,
+                )
+                inf_counts2 = _all_reduce_inference_counts(inf_counts2, device)
+                inf_metrics2 = _counts_to_inference_metrics(inf_counts2)
+            if is_main and args.double_val and val_dataset2 is not None:
                 print("Epoch {}: Val inference on second validation rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
                       .format(epoch_num, inf_metrics2['rmsds_lt2'], inf_metrics2['rmsds_lt5'], inf_metrics2['min_rmsds_lt2'], inf_metrics2['min_rmsds_lt5']))
                 logs.update({'valinf2_' + k: v for k, v in inf_metrics2.items()})
                 logs.update({'valinfcomb_' + k: (v + inf_metrics[k]) / 2 for k, v in inf_metrics2.items()})
                 logs['step'] = epoch_num + 1
 
+        if is_main:
             if args.inference_earlystop_metric in logs.keys() and \
                     (args.inference_earlystop_goal == 'min' and logs[args.inference_earlystop_metric] <= best_val_inference_value or
                      args.inference_earlystop_goal == 'max' and logs[args.inference_earlystop_metric] >= best_val_inference_value):
@@ -1007,6 +1073,7 @@ def _shared_ddp_worker(rank, args, gpu_ids, datasets, local_batches):
     args.world_size = len(gpu_ids)
     args.device = device
     args.parallel = 1
+    args._shared_ddp_local_batches = [int(x) for x in local_batches]
     args._shared_ddp_local_batch_size = int(local_batches[rank])
     args._shared_ddp_global_batch_size = int(sum(local_batches))
     args._shared_ddp_loss_scale = (
@@ -1048,7 +1115,7 @@ def _shared_ddp_worker(rank, args, gpu_ids, datasets, local_batches):
     )
 
     run_dir = os.path.join(args.log_dir, args.run_name)
-    train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset2, device)
+    train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, val_dataset, val_dataset2, device)
     dist.destroy_process_group()
 
 

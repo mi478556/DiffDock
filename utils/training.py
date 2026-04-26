@@ -802,7 +802,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     return out
 
 
-def inference_epoch_fix(model, complex_graphs, device, t_to_sigma, args):
+def inference_epoch_fix(model, complex_graphs, device, t_to_sigma, args, return_counts=False, show_progress=True):
     t_schedule = get_t_schedule(sigma_schedule='expbeta', inference_steps=args.inference_steps,
                                 inf_sched_alpha=1, inf_sched_beta=1)
     tr_schedule, rot_schedule, tor_schedule = t_schedule, t_schedule, t_schedule
@@ -811,7 +811,7 @@ def inference_epoch_fix(model, complex_graphs, device, t_to_sigma, args):
     loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
     rmsds, min_rmsds = [], []
 
-    for orig_complex_graph in tqdm(loader):
+    for orig_complex_graph in tqdm(loader, disable=not show_progress):
         data_list = [copy.deepcopy(orig_complex_graph) for _ in range(args.inference_samples)]
         randomize_position(data_list, args.no_torsion, False, args.tr_sigma_max)
 
@@ -874,6 +874,15 @@ def inference_epoch_fix(model, complex_graphs, device, t_to_sigma, args):
 
     rmsds = np.array(rmsds)
     min_rmsds = np.array(min_rmsds)
+    if return_counts:
+        return {
+            'rmsds_lt2_count': int((rmsds < 2).sum()),
+            'rmsds_lt5_count': int((rmsds < 5).sum()),
+            'rmsds_total': int(len(rmsds)),
+            'min_rmsds_lt2_count': int((min_rmsds < 2).sum()),
+            'min_rmsds_lt5_count': int((min_rmsds < 5).sum()),
+            'min_rmsds_total': int(len(min_rmsds)),
+        }
     losses = {'rmsds_lt2': (100 * (rmsds < 2).sum() / len(rmsds)),
               'rmsds_lt5': (100 * (rmsds < 5).sum() / len(rmsds)),
               'min_rmsds_lt2': (100 * (min_rmsds < 2).sum() / len(min_rmsds)),
