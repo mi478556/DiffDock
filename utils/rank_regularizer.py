@@ -394,9 +394,17 @@ def detached_rank_se3_teacher(
     return teacher_tr.detach(), teacher_rot.detach(), rank_energy.detach()
 
 
-def _signed_axis_rotation_candidates(device, dtype) -> Tensor:
-    axes = torch.eye(3, device=device, dtype=dtype)
-    return torch.cat([axes, -axes], dim=0)
+def _rank_oracle_rotation_candidates(device, dtype) -> Tensor:
+    """26 signed directions: cardinal axes, face diagonals, and cube diagonals."""
+    dirs = []
+    for x in (-1.0, 0.0, 1.0):
+        for y in (-1.0, 0.0, 1.0):
+            for z in (-1.0, 0.0, 1.0):
+                if x == 0.0 and y == 0.0 and z == 0.0:
+                    continue
+                dirs.append((x, y, z))
+    candidates = torch.tensor(dirs, device=device, dtype=dtype)
+    return candidates / torch.linalg.vector_norm(candidates, dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def _perturb_ligand_positions_by_graph_rotation(
@@ -431,7 +439,6 @@ def target_conditioned_rank_oracle_rot_teacher(
     min_delta: float = 0.05,
     min_cos: float = 0.0,
     min_energy_drop: float = 0.0,
-    require_energy_drop: bool = True,
     use_receptor_atoms: bool = True,
     ensemble_samples: int = 4,
     ensemble_translation_std: float = 0.5,
@@ -441,9 +448,10 @@ def target_conditioned_rank_oracle_rot_teacher(
     Build a detached target-conditioned rank-probe rotation teacher.
 
     This is a supervised training auxiliary, not a rank-only teacher. The rank
-    energy supplies signed rotation-axis candidates, and the known training
-    rot_score chooses the rank-supported candidate that is useful. At inference
-    or validation with the auxiliary disabled, none of this path is used.
+    energy supplies local rotation candidates, and the known training rot_score
+    weights a single blended teacher from candidates that improve target
+    alignment while preserving rank support. At inference or validation with
+    the auxiliary disabled, none of this path is used.
     """
     device = rot_pred.device
     dtype = rot_pred.dtype
@@ -492,7 +500,7 @@ def target_conditioned_rank_oracle_rot_teacher(
             ensemble_rotation_std=ensemble_rotation_std,
         )
 
-        candidate_dirs = _signed_axis_rotation_candidates(device, dtype)
+        candidate_dirs = _rank_oracle_rotation_candidates(device, dtype)
         candidate_energy = []
         for direction in candidate_dirs:
             graph_vec = direction.view(1, 3).expand(B, 3)
@@ -523,35 +531,42 @@ def target_conditioned_rank_oracle_rot_teacher(
         candidate_cos = candidate_dirs @ score_unit.T
         candidate_cos = candidate_cos.T
 
-        if require_energy_drop:
-            rank_supported = energy_drop > float(min_energy_drop)
-        else:
-            rank_supported = torch.isfinite(energy_drop)
-            if float(min_energy_drop) > 0.0:
-                rank_supported = rank_supported & (energy_drop > float(min_energy_drop))
-
-        candidate_value = torch.where(
-            rank_supported & contribution_mask.unsqueeze(1),
-            candidate_cos,
-            torch.full_like(candidate_cos, -1.0e6),
-        )
-        best_cos, best_idx = candidate_value.max(dim=1)
-        best_dir = candidate_dirs[best_idx]
-        best_drop = energy_drop.gather(1, best_idx.unsqueeze(1)).squeeze(1)
-
         pred_norm = torch.linalg.vector_norm(rot_pred.detach().to(dtype=dtype), dim=-1).clamp_min(1e-12)
         pred_cos = (rot_pred.detach().to(dtype=dtype) * rot_score_f).sum(dim=-1) / (pred_norm * score_norm.squeeze(1))
-        best_delta = best_cos - pred_cos
 
-        valid = (
-            contribution_mask
-            & torch.isfinite(best_cos)
-            & torch.isfinite(best_delta)
-            & (best_cos > -1.0e5)
-            & (best_cos >= float(min_cos))
-            & (best_delta >= float(min_delta))
+        candidate_delta = candidate_cos - pred_cos.unsqueeze(1)
+        energy_tolerance = 1e-4
+        energy_threshold = float(min_energy_drop)
+        rank_supported = torch.isfinite(energy_drop) & (energy_drop >= energy_threshold - energy_tolerance)
+
+        target_supported = (
+            torch.isfinite(candidate_cos)
+            & torch.isfinite(candidate_delta)
+            & (candidate_cos >= float(min_cos))
+            & (candidate_delta >= float(min_delta))
         )
-        teacher = torch.where(valid.unsqueeze(1), best_dir, torch.zeros_like(best_dir))
+        candidate_supported = rank_supported & target_supported & contribution_mask.unsqueeze(1)
+
+        rank_support = torch.relu(energy_drop - energy_threshold + energy_tolerance)
+        target_gain = torch.relu(candidate_delta - float(min_delta))
+        target_align = torch.relu(candidate_cos - float(min_cos))
+        candidate_weight = rank_support * target_gain * target_align
+        candidate_weight = torch.where(
+            candidate_supported,
+            candidate_weight,
+            torch.zeros_like(candidate_weight),
+        )
+
+        teacher_sum = candidate_weight @ candidate_dirs
+        teacher_norm = torch.linalg.vector_norm(teacher_sum, dim=-1, keepdim=True)
+        valid = contribution_mask & (teacher_norm.squeeze(1) > 1e-12)
+        teacher = torch.where(valid.unsqueeze(1), teacher_sum / teacher_norm.clamp_min(1e-12), torch.zeros_like(teacher_sum))
+
+        best_weight, best_idx = candidate_weight.max(dim=1)
+        best_cos = candidate_cos.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+        best_delta = candidate_delta.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+        best_drop = energy_drop.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+        valid = valid & (best_weight > 0.0)
         active = valid
         best_cos_out = torch.where(valid, best_cos, torch.zeros_like(best_cos))
         best_delta_out = torch.where(valid, best_delta, torch.zeros_like(best_delta))

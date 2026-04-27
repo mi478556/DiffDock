@@ -190,7 +190,6 @@ def parse_train_args():
     parser.add_argument("--rank_oracle_rot_min_delta", type=float, default=0.05)
     parser.add_argument("--rank_oracle_rot_min_cos", type=float, default=0.0)
     parser.add_argument("--rank_oracle_rot_min_energy_drop", type=float, default=0.0)
-    parser.add_argument("--rank_oracle_rot_require_energy_drop", action='store_true', default=True)
     parser.add_argument("--rank_oracle_rot_dynamic_weight", action='store_true', default=False)
     parser.add_argument("--rank_oracle_rot_dynamic_target_ratio", type=float, default=1.0)
     parser.add_argument("--rank_oracle_rot_dynamic_ema_beta", type=float, default=0.9)

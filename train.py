@@ -323,7 +323,6 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
             rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
             rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
-            rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
             rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
         )
         val_rank_weight = args.rank_weight if getattr(args, 'val_rank_weight', None) is None else args.val_rank_weight
@@ -373,7 +372,6 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
             rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
             rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
-            rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
             rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
         )
         train_losses = train_epoch(
@@ -823,7 +821,6 @@ def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loade
             rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
             rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
             rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
-            rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
             rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
         )
         train_losses = train_epoch(
@@ -920,7 +917,6 @@ def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loade
                 rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
                 rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
                 rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
-                rank_oracle_rot_require_energy_drop=args.rank_oracle_rot_require_energy_drop,
                 rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
             )
             val_losses = test_epoch(model.module, val_loader, device, t_to_sigma, val_loss_fn, args.test_sigma_intervals)

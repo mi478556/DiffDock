@@ -130,7 +130,6 @@ def loss_function(
     rank_oracle_rot_min_delta: float = 0.05,
     rank_oracle_rot_min_cos: float = 0.0,
     rank_oracle_rot_min_energy_drop: float = 0.0,
-    rank_oracle_rot_require_energy_drop: bool = True,
     rank_teacher_pred_norm_eps: float = 1e-3,
 ):
     # Gather complex times for the batch (support both list and Batched inputs)
@@ -400,7 +399,6 @@ def loss_function(
                 min_delta=float(rank_oracle_rot_min_delta),
                 min_cos=float(rank_oracle_rot_min_cos),
                 min_energy_drop=float(rank_oracle_rot_min_energy_drop),
-                require_energy_drop=bool(rank_oracle_rot_require_energy_drop),
                 use_receptor_atoms=True,
                 ensemble_samples=int(rank_ensemble_samples),
                 ensemble_translation_std=float(rank_ensemble_tr_std),
