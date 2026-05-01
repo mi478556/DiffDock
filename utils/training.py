@@ -555,6 +555,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                           'rank_oracle_rot_delta', 'rank_oracle_rot_energy_drop',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
     accum_count = 0
+    valid_batches = 0
     optimizer.zero_grad(set_to_none=True)
 
     progress = tqdm(loader, total=len(loader))
@@ -622,6 +623,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                         del p.grad
                 torch.cuda.empty_cache()
             else:
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    raise e
                 print(e)
                 optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
@@ -675,6 +678,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             accum_count = 0
 
         meter.add([loss.detach().cpu(), *loss_tuple[1:]])
+        valid_batches += 1
         if not score_loss_for_display.dim() == 0:
             score_loss_for_display = score_loss_for_display.mean()
         if batch_idx % postfix_interval == 0 or batch_idx + 1 == len(loader):
@@ -692,7 +696,9 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         global_step_skip = _dist_max_int(local_step_skip, device)
         if global_step_skip:
             optimizer.zero_grad(set_to_none=True)
-            return meter.summary()
+            out = meter.summary()
+            out['_valid_batches'] = float(valid_batches)
+            return out
 
         optimizer.step()
         if _has_nonfinite_param(model.parameters()):
@@ -702,10 +708,12 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         if ema_weights is not None:
             ema_weights.update(model.parameters())
 
-    return meter.summary()
+    out = meter.summary()
+    out['_valid_batches'] = float(valid_batches)
+    return out
 
 
-def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
+def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False, show_progress=True):
     model.eval()
     meter = AverageMeter(['loss', 'score_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'rank_loss', 'rank_gate_mean',
                           'rank_teacher_loss', 'rank_teacher_tr_loss', 'rank_teacher_rot_loss',
@@ -714,6 +722,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                           'rank_oracle_rot_delta', 'rank_oracle_rot_energy_drop',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
                          unpooled_metrics=True)
+    valid_batches = 0
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
@@ -725,7 +734,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
              'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
             unpooled_metrics=True, intervals=10)
 
-    progress = tqdm(loader, total=len(loader))
+    progress = tqdm(loader, total=len(loader), disable=not show_progress)
     postfix_interval = 10
     for batch_idx, data in enumerate(progress):
         try:
@@ -753,6 +762,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 names = _batch_names(data)
                 print("Bad validation loss, skipping batch with complexes", names)
                 continue
+            valid_batches += 1
             meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])
             score_loss_for_display = loss_tuple[1].detach()
             if not score_loss_for_display.dim() == 0:
@@ -796,6 +806,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 continue
 
     out = meter.summary()
+    out['_valid_batches'] = float(valid_batches)
+    out['_valid_count'] = float(meter.count)
     if test_sigma_intervals > 0: out.update(meter_all.summary())
     return out
 

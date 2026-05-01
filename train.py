@@ -45,6 +45,29 @@ def _all_reduce_metric_dict(metrics, device):
     return reduced
 
 
+def _all_reduce_metric_sum_count(metrics, count_key, device):
+    if not dist.is_initialized():
+        return metrics
+    count = float(metrics.get(count_key, 0.0) or 0.0)
+    count_tensor = torch.tensor(count, device=device)
+    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+    total_count = float(count_tensor.item())
+
+    reduced = dict(metrics)
+    for k, v in metrics.items():
+        if v is None:
+            reduced[k] = v
+            continue
+        if k == count_key:
+            reduced[k] = total_count
+            continue
+        weighted = float(v) * count
+        tensor = torch.tensor(weighted, device=device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        reduced[k] = float(tensor.item() / max(total_count, 1.0))
+    return reduced
+
+
 def _all_reduce_inference_counts(counts, device):
     if not dist.is_initialized():
         return counts
@@ -77,6 +100,17 @@ def _distributed_inference_indices(total_size, rank, local_batches):
         chunk = list(range(start, min(start + global_batch_size, int(total_size))))
         indices.extend(chunk[offset:offset + local_batch_size])
     return indices
+
+
+class FixedIndexSampler(Sampler):
+    def __init__(self, indices):
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __iter__(self):
+        return iter(self.indices)
 
 
 def _broadcast_scalar(value, device, src=0):
@@ -830,7 +864,11 @@ def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loade
             max_grad_norm=args.max_grad_norm,
             ddp_loss_scale=float(getattr(args, '_shared_ddp_loss_scale', 1.0)),
         )
-        train_losses = _all_reduce_metric_dict(train_losses, device)
+        train_losses['_metric_weight'] = (
+            float(train_losses.get('_valid_batches', 0.0) or 0.0) *
+            float(getattr(args, '_shared_ddp_local_batch_size', 1))
+        )
+        train_losses = _all_reduce_metric_sum_count(train_losses, '_metric_weight', device)
 
         if is_main:
             print("Epoch {}: Training score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}  lr {:.4f}"
@@ -879,47 +917,56 @@ def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loade
             if args.use_ema:
                 ema_weights.copy_to(model.parameters())
 
+        val_rank_weight = args.rank_weight if getattr(args, 'val_rank_weight', None) is None else args.val_rank_weight
+        val_rank_teacher_weight = args.rank_teacher_weight if getattr(args, 'val_rank_teacher_weight', None) is None else args.val_rank_teacher_weight
+        val_rank_oracle_rot_weight = epoch_rank_oracle_rot_weight if getattr(args, 'val_rank_oracle_rot_weight', None) is None else args.val_rank_oracle_rot_weight
+        val_loss_fn = functools.partial(
+            loss_function,
+            tr_weight=1.0, rot_weight=1.0, tor_weight=1.0,
+            no_torsion=args.no_torsion,
+            rank_weight=val_rank_weight,
+            rank_mode=args.rank_mode,
+            rank_k=args.rank_k,
+            rank_sigma=args.rank_sigma,
+            rank_alpha_tr=args.rank_alpha_tr,
+            rank_alpha_rot=args.rank_alpha_rot,
+            rank_ensemble_samples=args.rank_ensemble_samples,
+            rank_ensemble_tr_std=args.rank_ensemble_tr_std,
+            rank_ensemble_rot_std=args.rank_ensemble_rot_std,
+            rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
+            rank_gate_type=args.rank_gate_type,
+            rank_soft_gate_cutoff=args.rank_soft_gate_cutoff,
+            rank_soft_gate_temp=args.rank_soft_gate_temp,
+            rank_prune_eps=args.rank_prune_eps,
+            rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
+            rank_teacher_weight=val_rank_teacher_weight,
+            rank_teacher_tr_weight=args.rank_teacher_tr_weight,
+            rank_teacher_rot_weight=args.rank_teacher_rot_weight,
+            rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
+            rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
+            rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
+            rank_teacher_mode=getattr(args, 'rank_teacher_mode', None),
+            rank_oracle_rot_weight=val_rank_oracle_rot_weight,
+            rank_oracle_rot_mode=getattr(args, 'rank_oracle_rot_mode', None),
+            rank_oracle_rot_probe_eps=args.rank_oracle_rot_probe_eps,
+            rank_oracle_rot_sigma_min=args.rank_oracle_rot_sigma_min,
+            rank_oracle_rot_sigma_max=args.rank_oracle_rot_sigma_max,
+            rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
+            rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
+            rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
+            rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
+        )
+        val_losses = test_epoch(
+            model.module,
+            val_loader,
+            device,
+            t_to_sigma,
+            val_loss_fn,
+            args.test_sigma_intervals,
+            show_progress=is_main,
+        )
+        val_losses = _all_reduce_metric_sum_count(val_losses, '_valid_count', device)
         if is_main:
-            val_rank_weight = args.rank_weight if getattr(args, 'val_rank_weight', None) is None else args.val_rank_weight
-            val_rank_teacher_weight = args.rank_teacher_weight if getattr(args, 'val_rank_teacher_weight', None) is None else args.val_rank_teacher_weight
-            val_rank_oracle_rot_weight = epoch_rank_oracle_rot_weight if getattr(args, 'val_rank_oracle_rot_weight', None) is None else args.val_rank_oracle_rot_weight
-            val_loss_fn = functools.partial(
-                loss_function,
-                tr_weight=1.0, rot_weight=1.0, tor_weight=1.0,
-                no_torsion=args.no_torsion,
-                rank_weight=val_rank_weight,
-                rank_mode=args.rank_mode,
-                rank_k=args.rank_k,
-                rank_sigma=args.rank_sigma,
-                rank_alpha_tr=args.rank_alpha_tr,
-                rank_alpha_rot=args.rank_alpha_rot,
-                rank_ensemble_samples=args.rank_ensemble_samples,
-                rank_ensemble_tr_std=args.rank_ensemble_tr_std,
-                rank_ensemble_rot_std=args.rank_ensemble_rot_std,
-                rank_sigma_gate_cutoff=args.rank_sigma_gate_cutoff,
-                rank_gate_type=args.rank_gate_type,
-                rank_soft_gate_cutoff=args.rank_soft_gate_cutoff,
-                rank_soft_gate_temp=args.rank_soft_gate_temp,
-                rank_prune_eps=args.rank_prune_eps,
-                rank_prune_sigma_cutoff=args.rank_prune_sigma_cutoff,
-                rank_teacher_weight=val_rank_teacher_weight,
-                rank_teacher_tr_weight=args.rank_teacher_tr_weight,
-                rank_teacher_rot_weight=args.rank_teacher_rot_weight,
-                rank_teacher_min_tr_norm=args.rank_teacher_min_tr_norm,
-                rank_teacher_min_rot_norm=args.rank_teacher_min_rot_norm,
-                rank_teacher_use_rot_sign_flip=args.rank_teacher_use_rot_sign_flip,
-                rank_teacher_mode=getattr(args, 'rank_teacher_mode', None),
-                rank_oracle_rot_weight=val_rank_oracle_rot_weight,
-                rank_oracle_rot_mode=getattr(args, 'rank_oracle_rot_mode', None),
-                rank_oracle_rot_probe_eps=args.rank_oracle_rot_probe_eps,
-                rank_oracle_rot_sigma_min=args.rank_oracle_rot_sigma_min,
-                rank_oracle_rot_sigma_max=args.rank_oracle_rot_sigma_max,
-                rank_oracle_rot_min_delta=args.rank_oracle_rot_min_delta,
-                rank_oracle_rot_min_cos=args.rank_oracle_rot_min_cos,
-                rank_oracle_rot_min_energy_drop=args.rank_oracle_rot_min_energy_drop,
-                rank_teacher_pred_norm_eps=args.rank_teacher_pred_norm_eps,
-            )
-            val_losses = test_epoch(model.module, val_loader, device, t_to_sigma, val_loss_fn, args.test_sigma_intervals)
             logs.update({'val_' + k: v for k, v in val_losses.items()})
             val_selection_loss = val_losses.get('score_loss', val_losses['loss'])
             print("Epoch {}: Validation score_loss {:.4f}  total_loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   rank {:.4f}   rank_gate {:.4f}"
@@ -1034,8 +1081,9 @@ def train_shared_ddp(args, model, optimizer, scheduler, ema_weights, train_loade
                 torch.save(last_checkpoint, os.path.join(run_dir, 'last_model.pt'))
         else:
             val_selection_loss = 0.0
-
         val_selection_loss = _broadcast_scalar(val_selection_loss, device)
+        best_val_inference_value = _broadcast_scalar(best_val_inference_value, device)
+        best_val_secondary_value = _broadcast_scalar(best_val_secondary_value, device)
         current_rank_oracle_rot_weight = _broadcast_scalar(current_rank_oracle_rot_weight, device)
         rank_oracle_rot_ema_rank_loss = _broadcast_optional_scalar(rank_oracle_rot_ema_rank_loss, device)
         rank_oracle_rot_ema_oracle_loss = _broadcast_optional_scalar(rank_oracle_rot_ema_oracle_loss, device)
@@ -1093,10 +1141,16 @@ def _shared_ddp_worker(rank, args, gpu_ids, datasets, local_batches):
         train_sampler=train_sampler,
         batch_size=args._shared_ddp_local_batch_size,
     )
-    if rank == 0:
-        _, val_loader = construct_loader_from_datasets(args, device, train_dataset, val_dataset)
-    else:
-        val_loader = None
+    val_indices = _distributed_inference_indices(len(val_dataset), rank, local_batches)
+    val_sampler = FixedIndexSampler(val_indices)
+    _, val_loader = construct_loader_from_datasets(
+        args,
+        device,
+        train_dataset,
+        val_dataset,
+        val_sampler=val_sampler,
+        val_batch_size=args._shared_ddp_local_batch_size,
+    )
 
     model = get_model(args, device, t_to_sigma=t_to_sigma)
     optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
